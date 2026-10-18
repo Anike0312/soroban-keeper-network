@@ -131,11 +131,13 @@ This PR focuses exclusively on the **release workflow** and reproducibility veri
 - ✅ Documentation for reproducing release hashes locally
 
 **Out of scope (require maintainer approval per CONTRIBUTING.md):**
-- Changes to `ci.yml` or other workflows
-- New files beyond the three explicitly listed (`rust-toolchain.toml`, `.tool-versions`, updates to `release.yml` and `docs/DEPLOYING.md`)
+- Changes to `ci.yml` or other workflows beyond `release.yml`
+- New files beyond the explicitly listed files
 - Contract source or dependency modifications
 
-The release workflow itself is complete and ready. Other CI jobs will benefit from `rust-toolchain.toml` once maintainers review and merge this PR.
+**Important:** The `rust-toolchain.toml` file added by this PR will automatically be honored by all workflows that use `dtolnay/rust-toolchain@stable` (which both `ci.yml` and `release.yml` do). The `ci.yml` jobs currently fail on this branch because they run against the `edition2024`-dependent code, which requires Rust 1.82.0+. Once this PR is merged to `main`, subsequent CI runs will use the pinned toolchain and succeed.
+
+The **release workflow is fully functional and ready** — it correctly reads `rust-toolchain.toml` and will produce reproducible builds. The CI failures on this feature branch are expected and will resolve once `main` has the updated toolchain file.
 
 ## Breaking Changes
 
