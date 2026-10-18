@@ -135,8 +135,10 @@ None. This PR:
 
 These items need files outside the allowed list and should be flagged for maintainer approval:
 
-1. **`ci.yml` version consolidation** — Update `ci.yml`'s hardcoded wasm-opt version to also read from `.tool-versions` (currently uses `version_119` but should be consolidated)
+1. **`ci.yml` version consolidation** — Update `ci.yml`'s hardcoded use of `dtolnay/rust-toolchain@stable` to ensure it also honors the pinned Rust version from `rust-toolchain.toml`. Additionally, `cargo-audit` installation may need adjustment if newer versions require Rust > 1.82.0 (currently uses `stable` which can float). Consider either: (a) explicitly pinning `cargo-audit` version in `ci.yml`, or (b) using `@nightly` if future updates require it. This doesn't affect the release workflow but improves CI consistency.
+
 2. **`.cargo/config.toml` path remapping** — If future builds on different systems show embedded absolute paths, add `RUSTFLAGS` path remapping (currently not needed)
+
 3. **GitHub Actions pinning** — Review pinning of `actions/checkout@v7`, `actions/upload-artifact@v7` to specific commit SHAs for supply-chain hardening (currently uses version tags, which is acceptable)
 
 ## Acceptance Criteria
