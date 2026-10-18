@@ -123,6 +123,20 @@ Includes troubleshooting: wrong Rust version, wrong wasm-opt, dirty working tree
 
 **If builds fail to reproduce in CI:** The error message will include both WASMs so maintainers can inspect with `wasm2wat` + `diff` or `diffoscope` to find the root cause.
 
+## Scope & Constraints
+
+This PR focuses exclusively on the **release workflow** and reproducibility verification per issue #677:
+- ✅ Two builds in `release.yml` with identical hashes verified before publishing
+- ✅ Pinned toolchain versions in `rust-toolchain.toml` and `.tool-versions`
+- ✅ Documentation for reproducing release hashes locally
+
+**Out of scope (require maintainer approval per CONTRIBUTING.md):**
+- Changes to `ci.yml` or other workflows
+- New files beyond the three explicitly listed (`rust-toolchain.toml`, `.tool-versions`, updates to `release.yml` and `docs/DEPLOYING.md`)
+- Contract source or dependency modifications
+
+The release workflow itself is complete and ready. Other CI jobs will benefit from `rust-toolchain.toml` once maintainers review and merge this PR.
+
 ## Breaking Changes
 
 None. This PR:
@@ -135,7 +149,7 @@ None. This PR:
 
 These items need files outside the allowed list and should be flagged for maintainer approval:
 
-1. **`ci.yml` version consolidation** — Update `ci.yml`'s hardcoded use of `dtolnay/rust-toolchain@stable` to ensure it also honors the pinned Rust version from `rust-toolchain.toml`. Additionally, `cargo-audit` installation may need adjustment if newer versions require Rust > 1.82.0 (currently uses `stable` which can float). Consider either: (a) explicitly pinning `cargo-audit` version in `ci.yml`, or (b) using `@nightly` if future updates require it. This doesn't affect the release workflow but improves CI consistency.
+1. **`ci.yml` toolchain consistency** — Ensure `ci.yml` also benefits from the pinned `rust-toolchain.toml`. The action `dtolnay/rust-toolchain@stable` automatically reads `rust-toolchain.toml` when it exists, but `ci.yml` may have cached actions or needs a fresh run to pick up the new file. This doesn't affect the release workflow (which is the focus of this issue) but ensures all CI jobs use consistent toolchain versions.
 
 2. **`.cargo/config.toml` path remapping** — If future builds on different systems show embedded absolute paths, add `RUSTFLAGS` path remapping (currently not needed)
 
