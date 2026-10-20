@@ -14,13 +14,15 @@
 //!   expected to finish on its own, so a clean return from one is also
 //!   treated as a failure.
 //! - **A shutdown request drains, it does not abort.** On SIGINT or SIGTERM
-//!   ingestion finishes and checkpoints the page it is on, then stops; the
-//!   HTTP server stops accepting connections and lets in-flight requests
-//!   finish. A restart resumes from the checkpoint.
-//! - **Draining is bounded.** Open WebSocket subscriptions would otherwise
-//!   keep the server up indefinitely, so after `drain_timeout` whatever is
-//!   still running is dropped. Ingestion is idempotent, so the worst case is
-//!   re-reading one page on the next start.
+//!   ingestion finishes and checkpoints the pass it is on (see
+//!   [`Backfiller::run_until_shutdown`]), then stops; the HTTP server stops
+//!   accepting connections and lets in-flight requests finish. A restart
+//!   resumes from the checkpoint.
+//! - **Draining is bounded.** Ingestion is bounded by
+//!   `INDEXER_SHUTDOWN_DRAIN_SECS`. Open WebSocket subscriptions would
+//!   otherwise keep the server up indefinitely, so the HTTP side gets the same
+//!   window; after it, whatever is still running is dropped. Ingestion is
+//!   idempotent, so the worst case is re-reading one page on the next start.
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
@@ -38,16 +40,12 @@ use crate::ingest::Ingestor;
 use crate::rpc::EventSource;
 use crate::store::Store;
 
-/// How long a shutdown waits for ingestion and in-flight requests to finish.
-pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// The indexer's long-running half: everything `main` starts after
 /// configuration is validated and the store is open.
 pub struct Service<S: EventSource> {
     config: Config,
     source: S,
     ingestor: Ingestor,
-    drain_timeout: Duration,
 }
 
 impl<S: EventSource> Service<S> {
@@ -57,14 +55,7 @@ impl<S: EventSource> Service<S> {
             config,
             source,
             ingestor: Ingestor::new(store),
-            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
         }
-    }
-
-    /// Override how long shutdown waits before dropping what is still running.
-    pub fn with_drain_timeout(mut self, drain_timeout: Duration) -> Self {
-        self.drain_timeout = drain_timeout;
-        self
     }
 
     /// Bind the configured API address.
@@ -90,8 +81,8 @@ impl<S: EventSource> Service<S> {
             config,
             source,
             ingestor,
-            drain_timeout,
         } = self;
+        let drain_timeout = Duration::from_secs(config.shutdown_drain_secs);
 
         let (stop_tx, stop_rx) = watch::channel(false);
 
@@ -101,16 +92,23 @@ impl<S: EventSource> Service<S> {
             config.contract_id.clone(),
             config.backfill_page_size,
         );
-        let ingestion = backfiller.run_until(
+        let progress = backfiller.progress();
+        let mut ingestion_stop = stop_rx.clone();
+        let ingestion = backfiller.run_until_shutdown(
             config.start_ledger,
             Duration::from_secs(config.poll_interval_secs),
-            stop_rx.clone(),
+            drain_timeout,
+            Box::pin(async move {
+                let _ = ingestion_stop.wait_for(|stopped| *stopped).await;
+            }),
         );
 
         let app = api::router(
             ApiState {
                 ingestor,
                 caches: AggregateCaches::from_secs(config.cache_ttl_secs),
+                progress,
+                max_healthy_lag_ledgers: config.max_healthy_lag_ledgers,
             },
             config.rate_limit_per_second,
             config.rate_limit_burst,
@@ -250,6 +248,8 @@ mod tests {
             cache_ttl_secs: 0,
             rate_limit_per_second: 1_000,
             rate_limit_burst: 1_000,
+            shutdown_drain_secs: 5,
+            max_healthy_lag_ledgers: 60,
         }
     }
 
@@ -271,8 +271,7 @@ mod tests {
 
     async fn start(source: FixtureSource) -> (Service<FixtureSource>, TcpListener, String, Store) {
         let store = Store::connect("sqlite::memory:").await.expect("store");
-        let service = Service::new(config(), source, store.clone())
-            .with_drain_timeout(Duration::from_secs(5));
+        let service = Service::new(config(), source, store.clone());
         let listener = service.bind().await.expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         (service, listener, base, store)

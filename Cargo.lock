@@ -1521,6 +1521,15 @@ dependencies = [
 name = "keeper-registry"
 version = "0.1.0"
 dependencies = [
+ "keeper-treasury",
+ "proptest",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "keeper-treasury"
+version = "0.1.0"
+dependencies = [
  "proptest",
  "soroban-sdk",
 ]
@@ -2753,6 +2762,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "keeper-registry",
+ "keeper-treasury",
  "rand 0.8.7",
  "soroban-sdk",
  "thiserror 2.0.20",

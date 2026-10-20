@@ -9,6 +9,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./treasury": {
+      "types": "./dist/treasury/index.d.ts",
+      "import": "./dist/treasury/index.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
     }
   },
   "files": [
@@ -18,7 +26,9 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "lint": "eslint src",
-    "clean": "rm -rf dist dist-test"
+    "docs": "typedoc",
+    "docs:check": "typedoc --emit none",
+    "clean": "rm -rf dist docs/reference"
   },
   "peerDependencies": {
     "@stellar/stellar-sdk": "^16.2.0",
@@ -43,6 +53,7 @@
     "jsdom": "^25.0.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "typedoc": "^0.28.5",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
   },

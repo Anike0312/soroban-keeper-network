@@ -30,12 +30,14 @@
 //! See `docs/INDEXER_DESIGN.md` for the architecture and
 //! `docs/INDEXER_DEPLOYMENT.md` for running one.
 
+pub mod address;
 pub mod api;
 pub mod backfill;
 pub mod cache;
 pub mod config;
 pub mod events;
 pub mod ingest;
+pub mod progress;
 pub mod queries;
 pub mod reorg;
 pub mod rpc;
@@ -47,5 +49,6 @@ pub use backfill::Backfiller;
 pub use config::Config;
 pub use events::{EventPayload, EventType, IndexedEvent};
 pub use ingest::Ingestor;
+pub use progress::{IngestionProgress, ProgressSnapshot};
 pub use service::Service;
 pub use store::Store;

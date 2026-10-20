@@ -6,6 +6,8 @@ use soroban_sdk::{
     token, Address, Bytes, Symbol, TryIntoVal,
 };
 
+use keeper_treasury::{Treasury, TreasuryClient};
+
 use super::common::*;
 use crate::{split_reward, KeeperError, TaskStatus};
 
@@ -277,4 +279,90 @@ fn test_sweep_partial_sequence_conserves_remainder_and_leaves_other_balances_unt
         TaskStatus::Pending
     );
     assert_eq!(s.registry.keeper_balance(&keeper), 970_000i128);
+}
+
+/// E08 round trip: fees accrue from real executions, `sweep_fees` moves them
+/// to the admin, and the admin hands them to the treasury's `distribute`,
+/// which splits them so each configured recipient can withdraw exactly its
+/// share. Along the way, the registry's own solvency (invariant I-1,
+/// docs/ARCHITECTURE.md) is checked: the sweep moves exactly `FeesAccrued`
+/// and never task escrow or keeper balances.
+#[test]
+fn test_sweep_fees_round_trip_through_treasury_distribution() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+
+    let treasury_id = s.env.register(Treasury, ());
+    let treasury = TreasuryClient::new(&s.env, &treasury_id);
+    treasury.initialize(&s.admin, &s.token_id);
+    let dao = Address::generate(&s.env);
+    let staking_pool = Address::generate(&s.env);
+    let public_goods = Address::generate(&s.env);
+    treasury.add_recipient(&s.admin, &dao, &5_000);
+    treasury.add_recipient(&s.admin, &staking_pool, &3_333);
+    treasury.add_recipient(&s.admin, &public_goods, &1_667);
+
+    // An open task and two credited keepers: none of these may move.
+    let untouched_task_id = register_default_task(&s); // 1_000_000 escrowed
+    let keeper1 = executed_task_keeper(&s); // credited 970_000, fee 30_000
+    let keeper2 = Address::generate(&s.env);
+    let odd_task_id = register_reward_task(&s, 1_234_567);
+    s.registry.claim_task(&keeper2, &odd_task_id);
+    s.registry
+        .execute_task(&keeper2, &odd_task_id, &Bytes::from_slice(&s.env, b"proof"));
+    let (keeper2_net, odd_fee) = split_reward(1_234_567, s.registry.get_fee_bps()).unwrap();
+    assert_eq!(odd_fee, 37_037);
+
+    let fees = s.registry.fees_accrued();
+    assert_eq!(fees, 67_037);
+    let registry_before = token.balance(&s.registry.address);
+    let admin_before = token.balance(&s.admin);
+
+    s.registry.sweep_fees(&s.admin, &s.admin, &fees);
+
+    // I-1 after the sweep: exactly the accrued fees left the registry, and
+    // what remains is exactly open escrow plus keeper balances.
+    assert_eq!(s.registry.fees_accrued(), 0);
+    assert_eq!(token.balance(&s.registry.address), registry_before - fees);
+    assert_eq!(s.registry.keeper_balance(&keeper1), 970_000);
+    assert_eq!(s.registry.keeper_balance(&keeper2), keeper2_net);
+    assert_eq!(
+        s.registry.get_task(&untouched_task_id).status,
+        TaskStatus::Pending
+    );
+    assert_eq!(
+        token.balance(&s.registry.address),
+        s.registry.get_task(&untouched_task_id).reward + 970_000 + keeper2_net
+    );
+
+    // The sweep landed with the admin, who hands it to the treasury.
+    assert_eq!(token.balance(&s.admin), admin_before + fees);
+
+    treasury.distribute(&s.admin, &fees);
+
+    // Floor division per recipient; the remainder is never pulled from the
+    // caller (see `distribute`'s doc comment).
+    // 67_037 * 5_000 / 10_000 = 33_518.5 -> 33_518
+    // 67_037 * 3_333 / 10_000 = 22_343.43 -> 22_343
+    // 67_037 * 1_667 / 10_000 = 11_175.07 -> 11_175
+    let credited = 33_518i128 + 22_343 + 11_175;
+    assert_eq!(token.balance(&s.admin), admin_before + fees - credited);
+    let expected = [
+        (dao, 33_518i128),
+        (staking_pool, 22_343),
+        (public_goods, 11_175),
+    ];
+    let mut withdrawn_total = 0i128;
+    for (recipient, share) in expected.iter() {
+        assert_eq!(treasury.withdraw(recipient), *share);
+        assert_eq!(token.balance(recipient), *share);
+        withdrawn_total += share;
+    }
+    assert_eq!(withdrawn_total, credited);
+    assert_eq!(token.balance(&treasury_id), 0);
+    assert_eq!(treasury.total_distributed(), credited);
+
+    // Keepers can still withdraw exactly what they were credited.
+    assert_eq!(s.registry.withdraw_rewards(&keeper1), 970_000);
+    assert_eq!(s.registry.withdraw_rewards(&keeper2), keeper2_net);
 }

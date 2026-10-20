@@ -16,6 +16,10 @@ contract `VERSION` that changes event shapes is a coordinated indexer
 release, not a live `version()` dispatch. Both decisions, and what happens
 to already-ingested rows, are in [`docs/INDEXER_DESIGN.md`](../docs/INDEXER_DESIGN.md).
 
+For the database itself — every table, its columns, and how the API's
+derived views (a task's status, a keeper's balance, ...) are folded from
+the raw `events` table — see [`docs/INDEXER_SCHEMA.md`](../docs/INDEXER_SCHEMA.md).
+
 Ingestion polls the RPC's `getEvents`, the mechanism the keeper-bot already
 uses. Backfill and steady-state polling share one parsing path
 (`ingest::Ingestor::ingest_batch`); the only difference between them is the
@@ -39,6 +43,10 @@ problems at once and exits, rather than failing later inside the ingest loop.
 | `INDEXER_BIND_ADDRESS` | no | `127.0.0.1:8080` | API bind address |
 | `INDEXER_POLL_INTERVAL_SECS` | no | `5` | Seconds between polls once caught up |
 | `INDEXER_BACKFILL_PAGE_SIZE` | no | `200` | Ledgers per page during backfill |
+| `INDEXER_RATE_LIMIT_PER_SECOND` | no | `20` | Sustained API requests per second allowed per client |
+| `INDEXER_RATE_LIMIT_BURST` | no | `40` | API request burst allowed per client |
+| `INDEXER_MAX_HEALTHY_LAG_LEDGERS` | no | `60` | Ingestion lag, in ledgers, beyond which the health check reports unhealthy |
+| `INDEXER_SHUTDOWN_DRAIN_SECS` | no | `30` | Max seconds a SIGINT/SIGTERM shutdown waits for an in-flight ingestion pass to finish and checkpoint before exiting anyway |
 | `INDEXER_LOG` | no | `info` | `tracing` filter directive |
 
 `INDEXER_START_LEDGER` should be the contract's deployment ledger. On a
@@ -80,11 +88,14 @@ serves the API on `INDEXER_BIND_ADDRESS`:
 
 Ingestion and the HTTP server are supervised as one unit (`src/service.rs`).
 
-- **SIGINT or SIGTERM** starts a graceful shutdown. Ingestion finishes and
-  checkpoints the page it is on, then stops. The HTTP server stops accepting
-  connections and lets in-flight requests finish. The process exits `0`. Open
-  WebSocket subscriptions are cut off after 30 seconds if they are still
-  holding the server open.
+- **SIGINT (ctrl-c) or SIGTERM** (what a container orchestrator sends on a
+  normal stop or restart) starts a graceful shutdown. Ingestion stops starting
+  new passes and lets the one in flight finish and checkpoint. The HTTP server
+  stops accepting connections and lets in-flight requests finish. The process
+  exits `0`. Both are bounded by `INDEXER_SHUTDOWN_DRAIN_SECS` (default 30), so
+  a stuck pass or an open WebSocket subscription cannot block shutdown
+  indefinitely. If the bound is hit, the process exits anyway and the next
+  start resumes from the last checkpoint, since ingestion is idempotent.
 - **If either half fails**, the other is stopped and the process exits
   non-zero with the error in the log. That covers an RPC error, a ledger the
   source later reports differently (see `src/reorg.rs`), and the HTTP server
@@ -146,3 +157,35 @@ spend most of its life empty, and would be emptiest exactly when traffic is
 highest. Point lookups are not cached — their cost does not grow with traffic
 the same way, and they are the reads most likely to be checked right after a
 write.
+
+## Schema migrations
+
+The schema is versioned by [sqlx migrations](../indexer/migrations/) —
+numbered SQL files, checked in and reviewed like any other code change
+(issue #360). Which migrations have run against a given database is
+recorded by sqlx itself, in that database's `_sqlx_migrations` table, with
+a checksum per file: a committed migration that is edited after it shipped
+is refused at startup rather than silently producing databases built from
+different versions of the same "migration".
+
+Applying them is one command either way:
+
+- **On deploy, nothing** — `Store::connect` runs any pending migrations on
+  every start.
+- **Without starting an indexer** — ahead of a rollout, or against a
+  restored backup:
+
+  ```bash
+  cargo run -p keeper-indexer --bin migrate -- sqlite://indexer.db
+  # or with INDEXER_DATABASE_URL set, no argument needed
+  ```
+
+  The report lists every migration as `applied` / `already applied`, so a
+  no-op run on a current database is visible as exactly that.
+
+To add a migration: create `indexer/migrations/NNNN_short_name.sql` with
+the next number, never edit a shipped one (add a corrective migration
+instead), and let review read it like code — `tests/migrations.rs` pins
+that a fresh database reaches the current schema in one step, that
+migrating an existing database forward loses no data, and that a tampered
+shipped migration is refused.

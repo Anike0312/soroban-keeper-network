@@ -7,10 +7,12 @@
 //! parsing path means the two cannot drift as the event set evolves.
 
 use anyhow::{Context, Result};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
-use tokio::sync::watch;
 
 use crate::ingest::{IngestOutcome, Ingestor};
+use crate::progress::IngestionProgress;
 use crate::reorg::{LedgerDiscrepancyError, Observation, ReorgDetector};
 use crate::rpc::{EventSource, RawEvent};
 use crate::store::Checkpoint;
@@ -22,6 +24,7 @@ pub struct Backfiller<S: EventSource> {
     contract_id: String,
     page_size: u32,
     detector: ReorgDetector,
+    progress: IngestionProgress,
 }
 
 /// What a completed backfill did.
@@ -62,7 +65,17 @@ impl<S: EventSource> Backfiller<S> {
             contract_id: contract_id.into(),
             page_size: page_size.max(1),
             detector,
+            progress: IngestionProgress::new(),
         }
+    }
+
+    /// Handle to the shared ingestion-progress state (issue #359).
+    ///
+    /// The walk updates it on every cycle; the API's health check reads the
+    /// lag off it. Cloneable, so the server can hold one while the walk
+    /// keeps writing.
+    pub fn progress(&self) -> IngestionProgress {
+        self.progress.clone()
     }
 
     /// Fingerprint every ledger this page covers, and stop if one of them now
@@ -111,27 +124,17 @@ impl<S: EventSource> Backfiller<S> {
     /// interruption costs at most the page in flight -- and re-reading that
     /// page on restart is harmless, because ingestion is idempotent.
     pub async fn run_to_tip(&self, configured_start: u32) -> Result<BackfillReport> {
-        self.walk(configured_start, None).await
-    }
-
-    /// The walk behind [`run_to_tip`](Self::run_to_tip) and
-    /// [`run_until`](Self::run_until).
-    ///
-    /// `stop` is only consulted *between* pages. A page that has been fetched
-    /// is always stored and checkpointed before the walk looks at it, so a
-    /// shutdown never leaves events stored without the checkpoint that covers
-    /// them.
-    async fn walk(
-        &self,
-        configured_start: u32,
-        stop: Option<&watch::Receiver<bool>>,
-    ) -> Result<BackfillReport> {
         let mut next = self.resume_ledger(configured_start).await?;
         let tip = self
             .source
             .latest_ledger()
             .await
             .context("reading the chain tip")?;
+        self.progress.observe_tip(tip);
+        // The resume point itself is progress: everything below it was fully
+        // ingested by an earlier run, and lag must reflect that immediately
+        // rather than only after this pass's first page.
+        self.progress.observe_ingested(next.saturating_sub(1));
 
         let mut report = BackfillReport {
             last_ledger: next.saturating_sub(1),
@@ -139,12 +142,6 @@ impl<S: EventSource> Backfiller<S> {
         };
 
         while next <= tip {
-            if is_stopped(stop) {
-                // Not "backfill complete": the checkpoint written after the
-                // last page already says exactly how far the walk got.
-                return Ok(report);
-            }
-
             let page = self
                 .source
                 .get_events(&self.contract_id, next, self.page_size)
@@ -171,6 +168,9 @@ impl<S: EventSource> Backfiller<S> {
                     backfill_complete: scanned_through >= tip,
                 })
                 .await?;
+            // Only after the checkpoint: "ingested" here means the same thing
+            // it means to a restart - stored and checkpointed, not in flight.
+            self.progress.observe_ingested(scanned_through);
 
             next = scanned_through.saturating_add(1);
         }
@@ -188,63 +188,75 @@ impl<S: EventSource> Backfiller<S> {
                 .await?;
         }
 
+        self.progress.observe_cycle();
         Ok(report)
     }
 
-    /// Backfill to the tip, then poll for new ledgers indefinitely.
+    /// Backfill to the tip, then poll for new ledgers until `shutdown`
+    /// resolves.
     ///
     /// The steady-state loop is the same walk with a delay between passes; it
     /// re-enters `run_to_tip`, so no second code path exists to drift.
-    pub async fn run_forever(&self, configured_start: u32, poll_interval: Duration) -> Result<()> {
-        let (_keep_open, never_stopped) = watch::channel(false);
-        self.run_until(configured_start, poll_interval, never_stopped)
-            .await
-    }
-
-    /// [`run_forever`](Self::run_forever), but returns `Ok(())` once `stop`
-    /// turns `true`.
     ///
-    /// Stopping drains rather than aborts: the page being ingested finishes
-    /// and is checkpointed, then the loop returns. A sleep between polls is
-    /// cut short immediately. A stop sender that is dropped without sending
-    /// also counts as a stop, so a supervisor that dies cannot leave this
-    /// loop running unsupervised.
-    pub async fn run_until(
+    /// A signal is only acted on *between* passes or pages, never mid-write:
+    /// `shutdown` is raced against the in-flight pass, but when `shutdown`
+    /// wins that race the pass is not dropped -- it keeps running, bounded by
+    /// `max_drain`, so a page already fetched still gets ingested and
+    /// checkpointed rather than left half-applied. If `max_drain` elapses
+    /// first, this returns anyway rather than hanging on a stuck cycle; the
+    /// next start resumes from the last checkpoint, which is safe because
+    /// `ingest_batch` is idempotent (issue 0230).
+    pub async fn run_until_shutdown(
         &self,
         configured_start: u32,
         poll_interval: Duration,
-        mut stop: watch::Receiver<bool>,
+        max_drain: Duration,
+        mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
     ) -> Result<()> {
         loop {
-            let report = self.walk(configured_start, Some(&stop)).await?;
-            if report.stored > 0 {
-                tracing::info!(
-                    stored = report.stored,
-                    duplicates = report.duplicates,
-                    last_ledger = report.last_ledger,
-                    "ingested events"
-                );
-            }
-            if is_stopped(Some(&stop)) {
-                return Ok(());
+            let pass = self.run_to_tip(configured_start);
+            tokio::pin!(pass);
+
+            tokio::select! {
+                biased;
+                result = &mut pass => {
+                    self.log_pass(&result?);
+                }
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown requested; draining the in-flight ingestion pass");
+                    match tokio::time::timeout(max_drain, &mut pass).await {
+                        Ok(result) => self.log_pass(&result?),
+                        Err(_) => tracing::warn!(
+                            max_drain_secs = max_drain.as_secs(),
+                            "in-flight ingestion pass did not finish within the drain window; \
+                             exiting anyway -- the next start resumes from the last checkpoint",
+                        ),
+                    }
+                    return Ok(());
+                }
             }
 
             tokio::select! {
-                _ = tokio::time::sleep(poll_interval) => {}
-                // Fires on a stop or on the sender going away; the check at
-                // the top of the next pass tells them apart from noise.
-                _ = stop.changed() => {}
-            }
-            if is_stopped(Some(&stop)) {
-                return Ok(());
+                biased;
+                () = tokio::time::sleep(poll_interval) => {}
+                _ = &mut shutdown => {
+                    tracing::info!("shutdown requested between ingestion passes");
+                    return Ok(());
+                }
             }
         }
     }
-}
 
-/// Whether a stop has been requested. No receiver means "never stop".
-fn is_stopped(stop: Option<&watch::Receiver<bool>>) -> bool {
-    stop.is_some_and(|stop| *stop.borrow() || stop.has_changed().is_err())
+    fn log_pass(&self, report: &BackfillReport) {
+        if report.stored > 0 {
+            tracing::info!(
+                stored = report.stored,
+                duplicates = report.duplicates,
+                last_ledger = report.last_ledger,
+                "ingested events"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -652,5 +664,169 @@ mod tests {
             .expect("query")
             .expect("new task");
         assert_eq!(task.reward, I128(77));
+    }
+
+    fn immediate_shutdown() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async {})
+    }
+
+    fn never_shutdown() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(std::future::pending())
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_any_pass_starts_stops_without_waiting_for_a_poll_interval() {
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backfiller.run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                immediate_shutdown(),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "shutdown must be noticed without waiting out the (hour-long) poll interval"
+        );
+        result
+            .expect("run_until_shutdown")
+            .expect("no ingestion error");
+    }
+
+    #[tokio::test]
+    async fn shutdown_mid_pass_drains_it_before_exiting() {
+        let source = FixtureSource::new(history(), 320);
+        // The very first `get_events` call sleeps, so shutdown (already
+        // pending) is guaranteed to win the race against a pass that has
+        // only just started -- simulating a signal arriving mid-cycle.
+        source.delay_next(Duration::from_millis(30));
+        let backfiller = backfiller(source, 100).await;
+
+        backfiller
+            .run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                immediate_shutdown(),
+            )
+            .await
+            .expect("run_until_shutdown");
+
+        // The in-flight pass was drained, not truncated: its events are
+        // stored and its checkpoint saved, exactly as an uninterrupted
+        // backfill would leave them.
+        let checkpoint = backfiller
+            .ingestor
+            .store()
+            .checkpoint()
+            .await
+            .expect("checkpoint query")
+            .expect("a checkpoint was saved");
+        assert!(checkpoint.backfill_complete);
+        assert_eq!(checkpoint.last_ledger, 320);
+
+        let task = backfiller
+            .ingestor
+            .store()
+            .task_state(1)
+            .await
+            .expect("query")
+            .expect("task from the drained pass");
+        assert_eq!(task.reward, I128(1_000));
+        assert_eq!(task.status, TaskStatus::Executed);
+    }
+
+    #[tokio::test]
+    async fn a_pass_stuck_past_max_drain_still_returns() {
+        let source = FixtureSource::new(history(), 320);
+        source.delay_next(Duration::from_secs(3600));
+        let backfiller = backfiller(source, 100).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backfiller.run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_millis(20),
+                immediate_shutdown(),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "max_drain must bound the wait even though the pass never finishes"
+        );
+        result
+            .expect("run_until_shutdown")
+            .expect("no ingestion error");
+    }
+
+    #[tokio::test]
+    async fn shutdown_between_passes_stops_without_waiting_for_a_poll_interval() {
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+
+        // First call: no shutdown yet, so the initial catch-up pass runs to
+        // completion and the loop reaches the inter-pass sleep, which is
+        // then immediately cut short by shutdown.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            backfiller.run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                immediate_shutdown(),
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        result
+            .expect("run_until_shutdown")
+            .expect("no ingestion error");
+    }
+
+    #[tokio::test]
+    async fn a_failed_pass_propagates_the_error_instead_of_looping_forever() {
+        let source = FixtureSource::new(history(), 320);
+        source.fail_once_at(100);
+        let backfiller = backfiller(source, 100).await;
+
+        let err = backfiller
+            .run_until_shutdown(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(5),
+                never_shutdown(),
+            )
+            .await
+            .expect_err("the simulated RPC failure must surface, not be swallowed");
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("simulated RPC failure")),
+            "error chain should mention the simulated failure, got: {err:?}"
+        );
+    }
+    #[tokio::test]
+    async fn progress_reports_zero_lag_once_a_pass_reaches_the_tip() {
+        // Issue #359: lag is updated on every ingestion cycle. After a full
+        // pass the walk has both observed the tip and checkpointed through
+        // it, so the metric reads caught-up - and the cycle counter proves
+        // the loop actually ran rather than never starting.
+        let backfiller = backfiller(FixtureSource::new(history(), 320), 100).await;
+        let progress = backfiller.progress();
+        assert_eq!(progress.snapshot().lag_ledgers(), None);
+
+        backfiller.run_to_tip(100).await.expect("backfill");
+
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.latest_known_ledger, Some(320));
+        assert_eq!(snapshot.lag_ledgers(), Some(0));
+        assert_eq!(snapshot.cycles, 1);
     }
 }
