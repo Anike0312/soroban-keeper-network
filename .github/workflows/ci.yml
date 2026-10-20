@@ -523,7 +523,30 @@ jobs:
         run: npm run build
 
       - name: Test
+        if: matrix.node != '20'
         run: npm test
+
+      # Node 20 runs the same suite with coverage on, so the numbers are
+      # reported once rather than once per matrix leg. Reporting only: there is
+      # no threshold, so low coverage never fails the job.
+      - name: Test with coverage
+        if: matrix.node == '20'
+        run: npm run test:coverage
+
+      - name: Coverage summary
+        if: matrix.node == '20' && !cancelled()
+        run: |
+          {
+            echo "### sdk-ts coverage"
+            echo
+            if [ -f coverage/coverage-summary.json ]; then
+              echo "| Metric | Covered | Total | % |"
+              echo "|--------|---------|-------|---|"
+              jq -r '.total | to_entries[] | select(.key | IN("statements","branches","functions","lines")) | "| \(.key) | \(.value.covered) | \(.value.total) | \(.value.pct)% |"' coverage/coverage-summary.json
+            else
+              echo "No coverage report was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Lint
         run: npm run lint
