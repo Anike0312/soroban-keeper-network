@@ -584,6 +584,49 @@ jobs:
         run: npm run lint
 
   # ───────────────────────────────────────────────────────────────────────────
+  # ADVISORY — the `skn` command-line tool. Consumes the SDK build from the
+  # sdk-ts job the same way the bot does. Not in `ci-required` yet: it is a new
+  # package, and promoting it is a decision for the maintainers.
+  # ───────────────────────────────────────────────────────────────────────────
+  cli:
+    name: CLI (advisory)
+    runs-on: ubuntu-latest
+    needs: sdk-ts
+    defaults:
+      run:
+        working-directory: packages/cli
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+
+      - name: Download built SDK
+        uses: actions/download-artifact@v8
+        with:
+          name: sdk-ts-dist
+          path: packages/sdk-ts/dist
+
+      - name: Install SDK's own runtime dependencies
+        # Same reason as the bot job: Node resolves @stellar/stellar-sdk from
+        # the SDK's real path, so it must be installed under packages/sdk-ts.
+        working-directory: packages/sdk-ts
+        run: npm ci --no-audit --no-fund
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck and build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+  # ───────────────────────────────────────────────────────────────────────────
   # REQUIRED — the indexer service. Format, build and test. Storage is
   # SQLite, so the tests need no database service.
   #

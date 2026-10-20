@@ -10,7 +10,7 @@
 
 WASM := target/wasm32-unknown-unknown/release/keeper_registry.wasm
 
-.PHONY: help build test fmt fmt-check lint wasm optimize clean bot bot-test sdk-ts indexer ci check
+.PHONY: help build test fmt fmt-check lint wasm optimize clean bot bot-test sdk-ts cli indexer ci check
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -47,6 +47,9 @@ indexer: ## Format-check, build and test the indexer (matches CI)
 
 sdk-ts: ## Build and test the TypeScript SDK (matches CI)
 	cd packages/sdk-ts && npm install --no-audit --no-fund && npm run build && npm test && npm run lint
+
+cli: sdk-ts ## Build and test the skn CLI (needs the SDK build)
+	cd packages/cli && npm install --no-audit --no-fund && npm run build && npm test && npm run lint
 
 bot-test: sdk-ts ## Build the SDK then run the keeper bot's tests (matches CI) — bot depends on sdk-ts's dist/ output
 	cd examples/keeper-bot && npm install --no-audit --no-fund && npm test && npm run lint
