@@ -10,12 +10,6 @@
 
 WASM := target/wasm32-unknown-unknown/release/keeper_registry.wasm
 
-# Where the indexer's database-backed tests look for a Postgres. Unset by
-# default: without it those tests skip themselves, so `make ci` stays green on
-# a machine with no database. Override to run them for real, e.g.
-#   make indexer INDEXER_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/indexer_test
-INDEXER_TEST_DATABASE_URL ?=
-
 .PHONY: help build test fmt fmt-check lint wasm optimize clean bot bot-test sdk-ts indexer ci check
 
 help: ## Show this help
@@ -49,8 +43,7 @@ bot: ## Run the example keeper bot
 indexer: ## Format-check, build and test the indexer (matches CI)
 	cargo fmt --package keeper-indexer -- --check
 	cargo build --package keeper-indexer --locked
-	INDEXER_TEST_DATABASE_URL=$(INDEXER_TEST_DATABASE_URL) \
-		cargo test --package keeper-indexer --locked
+	cargo test --package keeper-indexer --locked
 
 sdk-ts: ## Build and test the TypeScript SDK (matches CI)
 	cd packages/sdk-ts && npm install --no-audit --no-fund && npm run build && npm test && npm run lint

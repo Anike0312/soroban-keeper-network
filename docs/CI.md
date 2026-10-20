@@ -43,47 +43,18 @@ contract-only PR skips the work — but unlike the advisory `fuzz-pr` job, a
 skip still reports success, which is what lets `indexer` be a required check
 without blocking contract-only work.
 
-### The ephemeral database
+### No database service
 
-The indexer's interesting tests are database tests: the `ON CONFLICT`
-idempotency constraint, the balance view's arithmetic, and the "latest event
-of each kind wins" ordering are all properties of Postgres, not of the Rust
-around it. Mocking them would only assert that the code sends the SQL it
-sends.
+The indexer stores everything in SQLite, so its tests use in-memory databases
+and need no service container. `tests/service_process.rs` also starts the real
+`keeper-indexer` binary against a mock Soroban RPC on localhost, so the job
+exercises the same startup and shutdown path an operator gets. Nothing in the
+suite needs a network beyond loopback.
 
-So the job declares a Postgres **service container**, created for that job and
-destroyed with it. It is deliberately not a shared instance: these tests drop
-and recreate their tables on every run, so a shared database would let
-concurrent CI runs corrupt each other and make a green result depend on what
-else happened to be running at the time.
-
-The container declares a `pg_isready` health check. Without it the job can
-start querying before Postgres accepts connections, which surfaces as a
-confusing connection error instead of a wait.
-
-### Why the tests skip without a database
-
-The database-backed tests read `INDEXER_TEST_DATABASE_URL`. When it is unset
-they **skip rather than fail**, because the required `test` job runs
-`cargo test --workspace` on a runner with no Postgres, and a contract
-contributor running `make ci` on their laptop does not have one either.
-Neither should go red over a database they were never expected to have.
-
-That skip is a hole worth closing on the one runner that *does* have a
-database: a test that skips itself still exits 0, so a mistyped connection URL
-would turn the whole suite into a silent no-op while the job stayed green. The
-job therefore asserts the skip notice does **not** appear in the test output,
-and fails if it does. A green `indexer` job means the database tests really
-ran.
-
-To run them locally, point the variable at any throwaway Postgres:
+To run it locally:
 
 ```bash
-docker run -d --name kn-pg -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=indexer_test -p 5432:5432 postgres:16
-
-INDEXER_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/indexer_test \
-  cargo test --package keeper-indexer
+cargo test --package keeper-indexer
 ```
 
 ## WASM size tracking

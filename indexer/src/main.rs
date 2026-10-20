@@ -5,7 +5,9 @@
 //! problems rather than part-way through its first poll.
 
 use anyhow::{Context, Result};
-use keeper_indexer::{Config, Ingestor, Store};
+use keeper_indexer::rpc::HttpClient;
+use keeper_indexer::service::shutdown_signal;
+use keeper_indexer::{Config, Service, Store};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -32,20 +34,30 @@ async fn main() -> Result<()> {
         "starting keeper indexer"
     );
 
+    let source = HttpClient::new(&config.rpc_url);
+    // A wrong INDEXER_RPC_URL should stop the boot, not surface as a failed
+    // poll a few seconds in.
+    source
+        .get_health()
+        .await
+        .context("checking the Soroban RPC endpoint")?;
+
     let store = Store::connect(&config.database_url)
         .await
         .context("opening the event store")?;
-    let ingestor = Ingestor::new(store);
 
-    tracing::info!("store ready; ingestion and API wiring land with the service loop");
+    let service = Service::new(config, source, store);
+    let listener = service.bind().await?;
+    tracing::info!(address = %listener.local_addr()?, "serving the /v1 API");
 
-    // Keep the process alive until interrupted; the ingest loop and API server
-    // are wired in by the backfill and API commits.
-    let _ = ingestor;
-    tokio::signal::ctrl_c()
+    // A returned error is a failed ingestion or HTTP task. Exiting non-zero
+    // (rather than leaving the other half running) is what lets a process
+    // supervisor notice and restart; ingestion resumes from its checkpoint.
+    service
+        .run(listener, shutdown_signal())
         .await
-        .context("waiting for shutdown signal")?;
-    tracing::info!("shutting down");
+        .context("keeper indexer stopped")?;
+    tracing::info!("shut down cleanly");
 
     Ok(())
 }

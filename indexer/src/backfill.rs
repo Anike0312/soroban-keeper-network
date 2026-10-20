@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use std::time::Duration;
+use tokio::sync::watch;
 
 use crate::ingest::{IngestOutcome, Ingestor};
 use crate::reorg::{LedgerDiscrepancyError, Observation, ReorgDetector};
@@ -110,6 +111,21 @@ impl<S: EventSource> Backfiller<S> {
     /// interruption costs at most the page in flight -- and re-reading that
     /// page on restart is harmless, because ingestion is idempotent.
     pub async fn run_to_tip(&self, configured_start: u32) -> Result<BackfillReport> {
+        self.walk(configured_start, None).await
+    }
+
+    /// The walk behind [`run_to_tip`](Self::run_to_tip) and
+    /// [`run_until`](Self::run_until).
+    ///
+    /// `stop` is only consulted *between* pages. A page that has been fetched
+    /// is always stored and checkpointed before the walk looks at it, so a
+    /// shutdown never leaves events stored without the checkpoint that covers
+    /// them.
+    async fn walk(
+        &self,
+        configured_start: u32,
+        stop: Option<&watch::Receiver<bool>>,
+    ) -> Result<BackfillReport> {
         let mut next = self.resume_ledger(configured_start).await?;
         let tip = self
             .source
@@ -123,6 +139,12 @@ impl<S: EventSource> Backfiller<S> {
         };
 
         while next <= tip {
+            if is_stopped(stop) {
+                // Not "backfill complete": the checkpoint written after the
+                // last page already says exactly how far the walk got.
+                return Ok(report);
+            }
+
             let page = self
                 .source
                 .get_events(&self.contract_id, next, self.page_size)
@@ -174,8 +196,27 @@ impl<S: EventSource> Backfiller<S> {
     /// The steady-state loop is the same walk with a delay between passes; it
     /// re-enters `run_to_tip`, so no second code path exists to drift.
     pub async fn run_forever(&self, configured_start: u32, poll_interval: Duration) -> Result<()> {
+        let (_keep_open, never_stopped) = watch::channel(false);
+        self.run_until(configured_start, poll_interval, never_stopped)
+            .await
+    }
+
+    /// [`run_forever`](Self::run_forever), but returns `Ok(())` once `stop`
+    /// turns `true`.
+    ///
+    /// Stopping drains rather than aborts: the page being ingested finishes
+    /// and is checkpointed, then the loop returns. A sleep between polls is
+    /// cut short immediately. A stop sender that is dropped without sending
+    /// also counts as a stop, so a supervisor that dies cannot leave this
+    /// loop running unsupervised.
+    pub async fn run_until(
+        &self,
+        configured_start: u32,
+        poll_interval: Duration,
+        mut stop: watch::Receiver<bool>,
+    ) -> Result<()> {
         loop {
-            let report = self.run_to_tip(configured_start).await?;
+            let report = self.walk(configured_start, Some(&stop)).await?;
             if report.stored > 0 {
                 tracing::info!(
                     stored = report.stored,
@@ -184,9 +225,26 @@ impl<S: EventSource> Backfiller<S> {
                     "ingested events"
                 );
             }
-            tokio::time::sleep(poll_interval).await;
+            if is_stopped(Some(&stop)) {
+                return Ok(());
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                // Fires on a stop or on the sender going away; the check at
+                // the top of the next pass tells them apart from noise.
+                _ = stop.changed() => {}
+            }
+            if is_stopped(Some(&stop)) {
+                return Ok(());
+            }
         }
     }
+}
+
+/// Whether a stop has been requested. No receiver means "never stop".
+fn is_stopped(stop: Option<&watch::Receiver<bool>>) -> bool {
+    stop.is_some_and(|stop| *stop.borrow() || stop.has_changed().is_err())
 }
 
 #[cfg(test)]
