@@ -488,8 +488,17 @@ jobs:
   # copies the referenced directory as-is, it does not build it.
   # ───────────────────────────────────────────────────────────────────────────
   sdk-ts:
-    name: SDK (TypeScript) (required)
+    name: SDK (TypeScript, Node ${{ matrix.node }}) (required)
     runs-on: ubuntu-latest
+    strategy:
+      # Let every Node version finish so one failure shows the whole picture.
+      fail-fast: false
+      matrix:
+        # Keep in step with `engines.node` in packages/sdk-ts/package.json:
+        # that field promises "20 and up", this list is what proves it. Node 18
+        # is not listed because it has no global `crypto`, which
+        # @stellar/stellar-sdk needs (17 sdk-ts tests fail there).
+        node: ["20", "22"]
     defaults:
       run:
         working-directory: packages/sdk-ts
@@ -498,7 +507,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ${{ matrix.node }}
 
       - name: Install dependencies
         # npm ci (not npm install) so a package.json/package-lock.json
@@ -519,7 +528,11 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Only one leg uploads: every matrix leg would otherwise try to create
+      # the same artifact name. `bot` runs on Node 20, so the Node 20 build is
+      # the one it should consume.
       - name: Upload built package (for the bot job to consume)
+        if: matrix.node == '20'
         uses: actions/upload-artifact@v7
         with:
           name: sdk-ts-dist
