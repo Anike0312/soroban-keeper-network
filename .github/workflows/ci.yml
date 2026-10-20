@@ -80,6 +80,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Shared host/dev-profile cache. This job is the only one that saves it;
+      # resource-cost, indexer and rust-sdk restore it read-only (they compile
+      # the same workspace for the same target in the same profile). Jobs whose
+      # artifacts differ keep their own key: build-wasm (wasm32, release),
+      # clippy (check-only metadata) and the fuzz jobs (nightly, fuzz/target).
       - name: Cache cargo
         uses: actions/cache@v6
         with:
@@ -88,8 +93,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: cargo test
         run: cargo test --workspace --locked
@@ -463,16 +468,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Restore shared cargo cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: Measure resource cost per entry point
         run: |
@@ -681,17 +686,17 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Cache cargo
+      - name: Restore shared cargo cache
         if: steps.changes.outputs.relevant == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-indexer-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-indexer-
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: cargo fmt --check
         if: steps.changes.outputs.relevant == 'true'
@@ -748,6 +753,17 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore shared cargo cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: Rust SDK tests
         run: cargo test --package soroban-keeper-sdk --locked
