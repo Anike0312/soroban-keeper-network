@@ -1,54 +1,3 @@
-# Keeper Indexer
-
-The event indexer for the `keeper-registry` contract — epic E14. The design
-this service implements is `docs/INDEXER_DESIGN.md`; read that first. This
-crate is currently the **scaffold** (issue 0219): it proves the plumbing —
-config validation, database + migrations, RPC health, the paginated ingest
-loop — and logs every raw event it observes without parsing or storing it.
-The schema and per-event ingestion land with the follow-up issues.
-
-## Run
-
-```sh
-INDEXER_RPC_URL=https://soroban-testnet.stellar.org \
-INDEXER_CONTRACT_ID=C... \
-DATABASE_URL=postgres://user:pass@localhost:5432/keeper_indexer \
-INDEXER_START_LEDGER=1000 \
-cargo run -p keeper-indexer
-```
-
-Startup order is deliberate: configuration is validated first (every failure
-names the variable and the reason, and never echoes the database URL — the
-same discipline as the keeper bot's `requireEnv`), then Postgres is connected
-and migrations run, then the RPC endpoint is health-checked, and only then
-does the loop start. A service that cannot store or reach the chain refuses
-to boot rather than crashing on first use.
-
-## Configuration
-
-| Variable | Required | Meaning |
-| --- | --- | --- |
-| `INDEXER_RPC_URL` | yes | Soroban RPC endpoint (https; http for localhost only) |
-| `INDEXER_CONTRACT_ID` | yes | The registry contract to observe (`C…` strkey) |
-| `DATABASE_URL` | yes | Postgres connection string (never echoed in errors) |
-| `INDEXER_START_LEDGER` | yes | First ledger to scan — the contract's deployment ledger |
-| `INDEXER_POLL_INTERVAL_MS` | no | Sleep between rounds once caught up (default 10000, min 1000) |
-
-## The loop
-
-One code path for backfill and steady state, per the design: the first
-request of a run uses `INDEXER_START_LEDGER`, every later request uses the
-cursor the RPC returned (the two parameters are mutually exclusive), every
-page is followed before sleeping, and a short page means caught up. A
-persisted cursor arrives with the schema issues — the scaffold intentionally
-re-observes from the start ledger on restart, which is safe precisely
-because it stores nothing yet.
-
-## Tests
-
-`cargo test -p keeper-indexer` — config validation (including the
-secret-redaction contract) and RPC response decoding. Nothing here needs a
-database or network.
 # Keeper Registry Indexer
 
 Indexes the keeper registry's on-chain events into a queryable store, and
@@ -66,6 +15,10 @@ One process tracks one registry contract id on one network; a future
 contract `VERSION` that changes event shapes is a coordinated indexer
 release, not a live `version()` dispatch. Both decisions, and what happens
 to already-ingested rows, are in [`docs/INDEXER_DESIGN.md`](../docs/INDEXER_DESIGN.md).
+
+For the database itself — every table, its columns, and how the API's
+derived views (a task's status, a keeper's balance, ...) are folded from
+the raw `events` table — see [`docs/INDEXER_SCHEMA.md`](../docs/INDEXER_SCHEMA.md).
 
 Ingestion polls the RPC's `getEvents`, the mechanism the keeper-bot already
 uses. Backfill and steady-state polling share one parsing path
@@ -90,12 +43,26 @@ problems at once and exits, rather than failing later inside the ingest loop.
 | `INDEXER_BIND_ADDRESS` | no | `127.0.0.1:8080` | API bind address |
 | `INDEXER_POLL_INTERVAL_SECS` | no | `5` | Seconds between polls once caught up |
 | `INDEXER_BACKFILL_PAGE_SIZE` | no | `200` | Ledgers per page during backfill |
+| `INDEXER_RATE_LIMIT_PER_SECOND` | no | `20` | Sustained API requests per second allowed per client |
+| `INDEXER_RATE_LIMIT_BURST` | no | `40` | API request burst allowed per client |
+| `INDEXER_MAX_HEALTHY_LAG_LEDGERS` | no | `60` | Ingestion lag, in ledgers, beyond which the health check reports unhealthy |
+| `INDEXER_SHUTDOWN_DRAIN_SECS` | no | `30` | Max seconds a SIGINT/SIGTERM shutdown waits for an in-flight ingestion pass to finish and checkpoint before exiting anyway |
 | `INDEXER_LOG` | no | `info` | `tracing` filter directive |
 
 `INDEXER_START_LEDGER` should be the contract's deployment ledger. On a
 network where that is not known exactly, any ledger at or before the
 `initialize` call works: ingestion is idempotent, so starting early costs
 extra scanning rather than correctness.
+
+## Shutdown
+
+On SIGINT (ctrl-c) or SIGTERM (what a container orchestrator sends on a
+normal stop or restart), the indexer stops starting new ingestion passes
+and, if one is already in flight, lets it finish and checkpoint before
+exiting — bounded by `INDEXER_SHUTDOWN_DRAIN_SECS`, so a stuck pass cannot
+block shutdown indefinitely. If that bound is hit, the process exits anyway;
+the next start resumes cleanly from the last checkpoint, since ingestion is
+idempotent.
 
 ## Running
 
@@ -151,3 +118,35 @@ spend most of its life empty, and would be emptiest exactly when traffic is
 highest. Point lookups are not cached — their cost does not grow with traffic
 the same way, and they are the reads most likely to be checked right after a
 write.
+
+## Schema migrations
+
+The schema is versioned by [sqlx migrations](../indexer/migrations/) —
+numbered SQL files, checked in and reviewed like any other code change
+(issue #360). Which migrations have run against a given database is
+recorded by sqlx itself, in that database's `_sqlx_migrations` table, with
+a checksum per file: a committed migration that is edited after it shipped
+is refused at startup rather than silently producing databases built from
+different versions of the same "migration".
+
+Applying them is one command either way:
+
+- **On deploy, nothing** — `Store::connect` runs any pending migrations on
+  every start.
+- **Without starting an indexer** — ahead of a rollout, or against a
+  restored backup:
+
+  ```bash
+  cargo run -p keeper-indexer --bin migrate -- sqlite://indexer.db
+  # or with INDEXER_DATABASE_URL set, no argument needed
+  ```
+
+  The report lists every migration as `applied` / `already applied`, so a
+  no-op run on a current database is visible as exactly that.
+
+To add a migration: create `indexer/migrations/NNNN_short_name.sql` with
+the next number, never edit a shipped one (add a corrective migration
+instead), and let review read it like code — `tests/migrations.rs` pins
+that a fresh database reaches the current schema in one step, that
+migrating an existing database forward loses no data, and that a tampered
+shipped migration is refused.
