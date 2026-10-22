@@ -28,7 +28,42 @@ stellar keys generate deployer --network testnet
 stellar keys fund deployer --network testnet
 ```
 
-## 3. Deploy
+## 3. Deploy and Initialize with `skn deploy` (Recommended)
+
+The `skn` CLI (`packages/cli`) uploads WASM, deploys, initializes, and writes
+the deployed contract IDs directly to your selected profile in
+`~/.config/skn/skn.config.json`. It prints every initialization parameter for
+confirmation before submitting and refuses mainnet deployments without
+`--confirm-mainnet`.
+
+```bash
+# Initialize default profiles (testnet, futurenet, mainnet) if you have not yet:
+skn config init
+
+# Deploy and initialize KeeperRegistry on testnet (saves contractId to profile):
+skn deploy registry \
+  --wasm target/wasm32-unknown-unknown/release/keeper_registry.wasm \
+  --identity deployer \
+  --profile testnet \
+  --fee-bps 300
+
+# Deploy and initialize Treasury on testnet (saves treasuryContractId to profile):
+skn deploy treasury \
+  --wasm target/wasm32-unknown-unknown/release/keeper_treasury.wasm \
+  --identity deployer \
+  --profile testnet
+
+# Or deploy and initialize both in one step:
+skn deploy all \
+  --registry-wasm target/wasm32-unknown-unknown/release/keeper_registry.wasm \
+  --treasury-wasm target/wasm32-unknown-unknown/release/keeper_treasury.wasm \
+  --identity deployer \
+  --profile testnet
+```
+
+For mainnet, pass `--network mainnet --confirm-mainnet` explicitly.
+
+## 4. Deploy and Initialize Manually with `stellar` CLI
 
 ```bash
 stellar contract deploy \
@@ -39,8 +74,6 @@ stellar contract deploy \
 ```
 
 > The repo also ships `scripts/deploy.sh` which wraps these steps.
-
-## 4. Initialize
 
 Pick a reward token — on testnet you can use the native XLM SAC address from
 `stellar contract id asset --asset native --network testnet`.
