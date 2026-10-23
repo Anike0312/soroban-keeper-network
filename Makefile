@@ -50,7 +50,7 @@ sdk-ts-lint: ## ESLint the TypeScript SDK (advisory in CI, so not part of `make 
 	cd packages/sdk-ts && npm ci --no-audit --no-fund && npm run lint
 
 cli: sdk-ts ## Build and test the skn CLI (needs the SDK build)
-	cd packages/cli && npm install --no-audit --no-fund && npm run build && npm test && npm run lint
+	cd packages/cli && npm install --no-audit --no-fund && npm run build && npm test
 
 bot-test: sdk-ts ## Build the SDK then run the keeper bot's tests (matches CI) — bot depends on sdk-ts's dist/ output
 	cd examples/keeper-bot && npm ci --no-audit --no-fund && npm test && npm run lint

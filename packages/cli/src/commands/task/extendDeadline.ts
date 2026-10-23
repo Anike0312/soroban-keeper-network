@@ -1,27 +1,34 @@
-import type { Command } from "commander";
+import { parseCommandArgs, type CommandContext } from "../../args.js";
+import { type RunResult } from "../../output.js";
+import { expectPositionals, parseTaskId, parseTime } from "../parse.js";
+import { finish, isRunResult, openSigned, requireMainnetConfirmation } from "../session.js";
+import { taskLines, taskView } from "./view.js";
 
-import { CliError, EXIT_USAGE } from "../../errors.js";
-import { parseDeadline, parseTaskId, printTask } from "../../format.js";
-import type { Handler, Runner } from "../types.js";
+/** `skn task extend-deadline <id> --to <time>`: moves a task's deadline later. */
+export async function runTaskExtendDeadline(
+  args: readonly string[],
+  context: CommandContext,
+): Promise<RunResult> {
+  const { values, positionals } = parseCommandArgs(args, { to: { type: "string" } });
+  expectPositionals(positionals, 1, "skn task extend-deadline <task-id> --to <time>");
+  const taskId = parseTaskId(positionals[0]);
+  const newDeadline = parseTime(values.to as string | undefined, "--to");
 
-export const extendDeadlineHandler: Handler = async (ctx, { args, opts }) => {
-  const taskId = parseTaskId(args[0] ?? "");
-  if (typeof opts.to !== "string") throw new CliError("--to is required.", EXIT_USAGE);
-  const newDeadline = parseDeadline(opts.to, "--to");
-  const signer = await ctx.signer();
+  const session = await openSigned(values, context);
+  if (isRunResult(session)) return session;
+  requireMainnetConfirmation(session.settings);
 
-  await ctx.chain.registry.extendDeadline({ owner: signer.publicKey, taskId, newDeadline, signer });
+  await session.client.extendDeadline({
+    owner: session.address,
+    taskId,
+    newDeadline,
+    signer: session.signer,
+  });
 
-  ctx.out.line(`Moved the deadline of task ${taskId} to ${newDeadline.toISOString()}.`);
-  const task = printTask(ctx.out, taskId, await ctx.chain.registry.getTask(taskId));
-  ctx.out.result({ action: "extend-deadline", task });
-};
-
-export function extendDeadlineCommand(parent: Command, run: Runner): void {
-  parent
-    .command("extend-deadline")
-    .description("Push a task's deadline later")
-    .argument("<task-id>", "id of the task")
-    .requiredOption("--to <time>", "new deadline: Unix seconds or ISO 8601")
-    .action(run(extendDeadlineHandler));
+  const view = taskView(taskId, await session.client.getTask(taskId));
+  return finish(
+    session,
+    [`Moved the deadline of task ${taskId} to ${newDeadline.toISOString()}.`, ...taskLines(view)].join("\n"),
+    { action: "extend-deadline", task: view },
+  );
 }

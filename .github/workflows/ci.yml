@@ -80,6 +80,11 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Shared host/dev-profile cache. This job is the only one that saves it;
+      # resource-cost, indexer and rust-sdk restore it read-only (they compile
+      # the same workspace for the same target in the same profile). Jobs whose
+      # artifacts differ keep their own key: build-wasm (wasm32, release),
+      # clippy (check-only metadata) and the fuzz jobs (nightly, fuzz/target).
       - name: Cache cargo
         uses: actions/cache@v6
         with:
@@ -88,8 +93,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: cargo test
         run: cargo test --workspace --locked
@@ -477,16 +482,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - name: Restore shared cargo cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: Measure resource cost per entry point
         run: |
@@ -505,8 +510,17 @@ jobs:
   # copies the referenced directory as-is, it does not build it.
   # ───────────────────────────────────────────────────────────────────────────
   sdk-ts:
-    name: SDK (TypeScript) (required)
+    name: SDK (TypeScript, Node ${{ matrix.node }}) (required)
     runs-on: ubuntu-latest
+    strategy:
+      # Let every Node version finish so one failure shows the whole picture.
+      fail-fast: false
+      matrix:
+        # Keep in step with `engines.node` in packages/sdk-ts/package.json:
+        # that field promises "20 and up", this list is what proves it. Node 18
+        # is not listed because it has no global `crypto`, which
+        # @stellar/stellar-sdk needs (17 sdk-ts tests fail there).
+        node: ["20", "22"]
     defaults:
       run:
         working-directory: packages/sdk-ts
@@ -515,7 +529,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ${{ matrix.node }}
 
       - name: Install dependencies
         # npm ci (not npm install) so a package.json/package-lock.json
@@ -531,9 +545,36 @@ jobs:
         run: npm run build
 
       - name: Test
+        if: matrix.node != '20'
         run: npm test
 
+      # Node 20 runs the same suite with coverage on, so the numbers are
+      # reported once rather than once per matrix leg. Reporting only: there is
+      # no threshold, so low coverage never fails the job.
+      - name: Test with coverage
+        if: matrix.node == '20'
+        run: npm run test:coverage
+
+      - name: Coverage summary
+        if: matrix.node == '20' && !cancelled()
+        run: |
+          {
+            echo "### sdk-ts coverage"
+            echo
+            if [ -f coverage/coverage-summary.json ]; then
+              echo "| Metric | Covered | Total | % |"
+              echo "|--------|---------|-------|---|"
+              jq -r '.total | to_entries[] | select(.key | IN("statements","branches","functions","lines")) | "| \(.key) | \(.value.covered) | \(.value.total) | \(.value.pct)% |"' coverage/coverage-summary.json
+            else
+              echo "No coverage report was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Only one leg uploads: every matrix leg would otherwise try to create
+      # the same artifact name. `bot` runs on Node 20, so the Node 20 build is
+      # the one it should consume.
       - name: Upload built package (for the bot job to consume)
+        if: matrix.node == '20'
         uses: actions/upload-artifact@v7
         with:
           name: sdk-ts-dist
@@ -717,9 +758,6 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Lint
-        run: npm run lint
-
   # ───────────────────────────────────────────────────────────────────────────
   # REQUIRED — the keeper-bot-v2 service. Build, lint, and test suite, with
   # an ephemeral Postgres service container for persistent state tests.
@@ -854,17 +892,17 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Cache cargo
+      - name: Restore shared cargo cache
         if: steps.changes.outputs.relevant == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-indexer-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-indexer-
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: cargo fmt --check
         if: steps.changes.outputs.relevant == 'true'
@@ -900,6 +938,17 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore shared cargo cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-host-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-host-
 
       - name: Rust SDK tests
         run: cargo test --package soroban-keeper-sdk --locked

@@ -1,170 +1,218 @@
-import { TaskStatus } from "@soroban-keeper-network/sdk";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { EXIT } from "../src/exitCodes.js";
+import { CONTRACT_ID, TEST_PUBLIC, TEST_SECRET, scratchDir } from "./support/env.js";
+import { FakeRpc } from "./support/fakeRpc.js";
+import { rawTask, skn } from "./support/run.js";
 
-import { ADDRESS, CONTRACT, fakeRegistry, skn, task } from "./harness.js";
+let dir: string;
+let cleanup: () => Promise<void>;
 
-describe("task cancel", () => {
-  it("cancels and prints the resulting state", async () => {
-    const registry = fakeRegistry();
-    registry.getTask.mockResolvedValue(task({ status: TaskStatus.Cancelled }));
-    const run = await skn(["task", "cancel", "7"], registry);
+beforeEach(async () => {
+  ({ dir, cleanup } = await scratchDir());
+});
+afterEach(async () => {
+  await cleanup();
+});
 
-    expect(run.code).toBe(0);
-    expect(registry.cancelTask).toHaveBeenCalledWith(expect.objectContaining({ owner: ADDRESS, taskId: 7n }));
-    expect(run.stdout).toContain("Cancelled task 7");
-    expect(run.stdout).toContain("status:   cancelled");
+const base = ["--contract-id", CONTRACT_ID];
+
+describe("skn task cancel", () => {
+  it("cancels and prints the resulting task state", async () => {
+    const server = new FakeRpc({ results: { get_task: rawTask({ status: 3 }) } });
+    const result = await skn(["task", "cancel", "7", ...base], server, dir);
+
+    expect(result.exitCode).toBe(EXIT.ok);
+    expect(result.stdout).toContain("Cancelled task 7");
+    expect(result.stdout).toContain("status:   cancelled");
+    expect(server.submitted).toHaveLength(1);
+    expect(server.calls[0]).toMatchObject({ method: "cancel_task", args: [TEST_PUBLIC, 7n] });
   });
 
-  it("explains when a claimed task becomes cancellable", async () => {
-    const registry = fakeRegistry();
-    registry.cancelTask.mockResolvedValue({ status: "lock_period_active" });
-    registry.getTask.mockResolvedValue(
-      task({ status: TaskStatus.Claimed, claimer: "GKEEPER", claimLedger: 900, lockLedgers: 200 }),
-    );
-    const run = await skn(["task", "cancel", "7"], registry, { latestLedger: 1_000 });
+  it("explains when a claimed task can be cancelled, and submits nothing", async () => {
+    const server = new FakeRpc({
+      latestLedger: 1_000,
+      simulationErrors: { cancel_task: "host invocation failed: Error(Contract, #9)" },
+      results: {
+        get_task: rawTask({ status: 1, claimer: TEST_PUBLIC, claim_ledger: 900, lock_ledgers: 200 }),
+      },
+    });
+    const result = await skn(["task", "cancel", "7", ...base], server, dir);
 
-    expect(run.code).toBe(1);
-    expect(run.stderr).toContain("claimed by GKEEPER");
-    expect(run.stderr).toContain("once its lock lapses");
-    // 900 + 200 = 1100; 100 ledgers from 1000, about 500 seconds.
-    expect(run.stderr).toContain("100 ledgers");
-    expect(run.stderr).toContain("ledger 1100");
+    expect(result.exitCode).toBe(EXIT.contract);
+    expect(result.stderr).toContain("LockPeriodActive");
+    expect(result.stderr).toContain("once its lock lapses");
+    // Claimed at 900 with a lock of 200 lapses at 1100, which is 100 ledgers from 1000.
+    expect(result.stderr).toContain("ledger 1100");
+    expect(result.stderr).toContain("100 ledgers");
+    expect(server.submitted).toHaveLength(0);
   });
 
-  it("says so when the lock has already lapsed by the time it checks", async () => {
-    const registry = fakeRegistry();
-    registry.cancelTask.mockResolvedValue({ status: "lock_period_active" });
-    registry.getTask.mockResolvedValue(task({ status: TaskStatus.Claimed, claimer: "GK", claimLedger: 100, lockLedgers: 50 }));
-    const run = await skn(["task", "cancel", "7"], registry, { latestLedger: 5_000 });
-    expect(run.stderr).toContain("try again");
+  it("says the lock has already lapsed when the ledger is past it", async () => {
+    const server = new FakeRpc({
+      latestLedger: 5_000,
+      simulationErrors: { cancel_task: "host invocation failed: Error(Contract, #9)" },
+      results: { get_task: rawTask({ status: 1, claimer: TEST_PUBLIC, claim_ledger: 100, lock_ledgers: 50 }) },
+    });
+    const result = await skn(["task", "cancel", "7", ...base], server, dir);
+    expect(result.stderr).toContain("can retry");
   });
 
   it("reports a task that can never be cancelled", async () => {
-    const registry = fakeRegistry();
-    registry.cancelTask.mockResolvedValue({ status: "invalid_task_status" });
-    registry.getTask.mockResolvedValue(task({ status: TaskStatus.Executed }));
-    const run = await skn(["task", "cancel", "7"], registry);
-    expect(run.code).toBe(1);
-    expect(run.stderr).toContain("already executed");
+    const server = new FakeRpc({
+      simulationErrors: { cancel_task: "host invocation failed: Error(Contract, #5)" },
+      results: { get_task: rawTask({ status: 2 }) },
+    });
+    const result = await skn(["task", "cancel", "7", ...base], server, dir);
+    expect(result.exitCode).toBe(EXIT.contract);
+    expect(result.stderr).toContain("already executed");
+  });
+
+  it("gives a machine-readable refusal with --json", async () => {
+    const server = new FakeRpc({
+      latestLedger: 1_000,
+      simulationErrors: { cancel_task: "host invocation failed: Error(Contract, #9)" },
+      results: { get_task: rawTask({ status: 1, claimer: TEST_PUBLIC, claim_ledger: 900, lock_ledgers: 200 }) },
+    });
+    const result = await skn(["task", "cancel", "7", "--json", ...base], server, dir);
+    const body = JSON.parse(result.stdout) as { error: { contractError: string; lockedUntilLedger: number } };
+    expect(body.error.contractError).toBe("LockPeriodActive");
+    expect(body.error.lockedUntilLedger).toBe(1_100);
   });
 
   it("rejects a bad task id before touching the network", async () => {
-    const registry = fakeRegistry();
-    const run = await skn(["task", "cancel", "seven"], registry);
-    expect(run.code).toBe(2);
-    expect(registry.cancelTask).not.toHaveBeenCalled();
+    const server = new FakeRpc();
+    const result = await skn(["task", "cancel", "seven", ...base], server, dir);
+    expect(result.exitCode).toBe(EXIT.usage);
+    expect(server.calls).toHaveLength(0);
   });
 });
 
-describe("task expire", () => {
+describe("skn task expire", () => {
   it("expires as the signer and prints the state", async () => {
-    const registry = fakeRegistry();
-    registry.getTask.mockResolvedValue(task({ status: TaskStatus.Expired }));
-    const run = await skn(["task", "expire", "3"], registry);
-    expect(run.code).toBe(0);
-    expect(registry.expireTask).toHaveBeenCalledWith(expect.objectContaining({ taskId: 3n, caller: ADDRESS }));
-    expect(run.stdout).toContain("status:   expired");
+    const server = new FakeRpc({ results: { get_task: rawTask({ status: 4 }) } });
+    const result = await skn(["task", "expire", "3", ...base], server, dir);
+
+    expect(result.exitCode).toBe(EXIT.ok);
+    expect(result.stdout).toContain("status:   expired");
+    expect(server.calls[0]).toMatchObject({ method: "expire_task", args: [3n] });
+    expect(server.submitted).toHaveLength(1);
   });
 
-  it("surfaces a contract rejection as a one-line error", async () => {
-    const { KeeperContractError, KeeperErrorCode } = await import("@soroban-keeper-network/sdk");
-    const registry = fakeRegistry();
-    registry.expireTask.mockRejectedValue(new KeeperContractError(KeeperErrorCode.DeadlineNotPassed));
-    const run = await skn(["task", "expire", "3"], registry);
-    expect(run.code).toBe(1);
-    expect(run.stderr).toContain("The contract rejected the call");
-    expect(run.stderr).not.toContain("    at ");
+  it("explains a refusal using the contract's own error table", async () => {
+    const server = new FakeRpc({
+      simulationErrors: { expire_task: "host invocation failed: Error(Contract, #7)" },
+    });
+    const result = await skn(["task", "expire", "3", ...base], server, dir);
+    expect(result.exitCode).toBe(EXIT.contract);
+    expect(result.stderr).toContain("DeadlineNotPassed");
   });
 });
 
-describe("task increase-reward", () => {
+describe("skn task increase-reward", () => {
   it("adds to the reward and prints the state", async () => {
-    const registry = fakeRegistry();
-    registry.getTask.mockResolvedValue(task({ reward: 750n }));
-    const run = await skn(["task", "increase-reward", "7", "--by", "250"], registry);
-    expect(registry.increaseReward).toHaveBeenCalledWith(
-      expect.objectContaining({ owner: ADDRESS, taskId: 7n, additional: 250n }),
+    const server = new FakeRpc({ results: { get_task: rawTask({ reward: 5_000_250n }) } });
+    const result = await skn(["task", "increase-reward", "7", "--by", "250", ...base], server, dir);
+
+    expect(result.exitCode).toBe(EXIT.ok);
+    expect(server.calls[0]).toMatchObject({ method: "increase_reward", args: [TEST_PUBLIC, 7n, 250n] });
+    expect(result.stdout).toContain("reward:   5000250");
+  });
+
+  it("insists on a positive whole-number amount", async () => {
+    for (const by of ["1.5", "0", "-3"]) {
+      const result = await skn(["task", "increase-reward", "7", "--by", by, ...base], new FakeRpc(), dir);
+      expect(result.exitCode).toBe(EXIT.usage);
+    }
+  });
+});
+
+describe("skn task extend-deadline", () => {
+  it("accepts an ISO time and passes Unix seconds to the contract", async () => {
+    const server = new FakeRpc({ results: { get_task: rawTask() } });
+    const result = await skn(
+      ["task", "extend-deadline", "7", "--to", "2031-01-01T00:00:00Z", ...base],
+      server,
+      dir,
     );
-    expect(run.stdout).toContain("reward:   750");
+    expect(result.exitCode).toBe(EXIT.ok);
+    expect(server.calls[0]).toMatchObject({
+      method: "extend_deadline",
+      args: [TEST_PUBLIC, 7n, 1_924_992_000n],
+    });
   });
 
-  it("insists on a whole-number amount", async () => {
-    const run = await skn(["task", "increase-reward", "7", "--by", "1.5"], fakeRegistry());
-    expect(run.code).toBe(2);
-  });
-});
-
-describe("task extend-deadline", () => {
-  it("accepts ISO time and passes a Date to the SDK", async () => {
-    const registry = fakeRegistry();
-    const run = await skn(["task", "extend-deadline", "7", "--to", "2031-01-01T00:00:00Z"], registry);
-    const call = registry.extendDeadline.mock.calls[0]?.[0] as { newDeadline: Date; taskId: bigint };
-    expect(call.taskId).toBe(7n);
-    expect(call.newDeadline.toISOString()).toBe("2031-01-01T00:00:00.000Z");
-    expect(run.stdout).toContain("2031-01-01T00:00:00.000Z");
-  });
-
-  it("accepts Unix seconds", async () => {
-    const registry = fakeRegistry();
-    await skn(["task", "extend-deadline", "7", "--to", "1900000000"], registry);
-    const call = registry.extendDeadline.mock.calls[0]?.[0] as { newDeadline: Date };
-    expect(call.newDeadline.getTime()).toBe(1_900_000_000_000);
-  });
-
-  it("rejects a nonsense time", async () => {
-    const run = await skn(["task", "extend-deadline", "7", "--to", "someday"], fakeRegistry());
-    expect(run.code).toBe(2);
+  it("rejects a time it cannot read", async () => {
+    const result = await skn(["task", "extend-deadline", "7", "--to", "someday", ...base], new FakeRpc(), dir);
+    expect(result.exitCode).toBe(EXIT.usage);
   });
 });
 
-describe("task register", () => {
+describe("skn task register", () => {
   it("registers as the signer and prints the new task", async () => {
-    const registry = fakeRegistry();
-    const run = await skn(
-      ["task", "register", "--type", "oracle-price-push", "--reward", "500", "--deadline", "2031-01-01T00:00:00Z",
-        "--ttl-ledgers", "100000", "--lock-ledgers", "50", "--calldata", "0a1b"],
-      registry,
+    const server = new FakeRpc({ results: { register_task: 12n, get_task: rawTask() } });
+    const result = await skn(
+      [
+        "task", "register", "--type", "oracle-price-push", "--reward", "5000000",
+        "--deadline", "2031-01-01T00:00:00Z", "--ttl-ledgers", "17280", "--lock-ledgers", "100",
+        "--calldata", "0a1b", ...base,
+      ],
+      server,
+      dir,
     );
-    expect(run.stderr).toBe("");
-    expect(run.code).toBe(0);
-    const call = registry.registerTask.mock.calls[0]?.[0] as Record<string, unknown>;
-    expect(call).toMatchObject({ owner: ADDRESS, taskType: 1, reward: 500n, ttlLedgers: 100000, lockLedgers: 50 });
-    expect(Array.from(call.calldata as Uint8Array)).toEqual([0x0a, 0x1b]);
-    expect(run.stdout).toContain("Registered task 7");
+    expect(result.exitCode).toBe(EXIT.ok);
+    expect(result.stdout).toContain("Registered task 12");
+    expect(server.calls[0]?.method).toBe("register_task");
+    expect(server.calls[0]?.args[0]).toBe(TEST_PUBLIC);
   });
 
-  it("lists valid types for an unknown one", async () => {
-    const run = await skn(
-      ["task", "register", "--type", "nope", "--reward", "1", "--deadline", "1900000000", "--ttl-ledgers", "1", "--lock-ledgers", "1"],
-      fakeRegistry(),
+  it("lists the valid types for an unknown one", async () => {
+    const result = await skn(
+      ["task", "register", "--type", "nope", "--reward", "1", "--deadline", "1900000000",
+        "--ttl-ledgers", "1", "--lock-ledgers", "1", ...base],
+      new FakeRpc(),
+      dir,
     );
-    expect(run.code).toBe(2);
-    expect(run.stderr).toContain("Liquidation");
+    expect(result.exitCode).toBe(EXIT.usage);
+    expect(result.stderr).toContain("Liquidation");
   });
 });
 
-describe("output and configuration", () => {
-  it("prints a single JSON document with --json", async () => {
-    const run = await skn(["task", "expire", "3", "--json"], fakeRegistry());
-    const body = JSON.parse(run.stdout);
+describe("shared behaviour of task commands", () => {
+  it("prints one JSON document with --json", async () => {
+    const server = new FakeRpc({ results: { get_task: rawTask({ status: 4 }) } });
+    const result = await skn(["task", "expire", "3", "--json", ...base], server, dir);
+    const body = JSON.parse(result.stdout) as { action: string; task: { id: string; status: string } };
     expect(body.action).toBe("expire");
-    expect(body.task.id).toBe("3");
+    expect(body.task).toMatchObject({ id: "3", status: "expired" });
   });
 
-  it("requires a contract id", async () => {
-    const run = await skn(["task", "expire", "3"], fakeRegistry(), { env: { SKN_CONTRACT_ID: "" } });
-    expect(run.code).toBe(2);
-    expect(run.stderr).toContain("--contract-id");
+  it("asks for a signing key and sends nothing without one", async () => {
+    const server = new FakeRpc();
+    const result = await skn(["task", "cancel", "7", ...base], server, dir, { SKN_SECRET_KEY: "" });
+    expect(result.exitCode).toBe(EXIT.usage);
+    expect(result.stderr).toContain("no signing key");
+    expect(server.calls).toHaveLength(0);
   });
 
-  it("uses the network preset and lets --rpc-url override it", async () => {
-    const run = await skn(["task", "expire", "3", "--network", "mainnet", "--rpc-url", "http://localhost:8000"], fakeRegistry());
-    expect(run.connections[0]).toMatchObject({ contractId: CONTRACT, rpcUrl: "http://localhost:8000" });
-    expect(run.connections[0]?.networkPassphrase).toContain("Public Global");
+  it("refuses to send on mainnet without --confirm-mainnet", async () => {
+    const server = new FakeRpc();
+    const result = await skn(["task", "cancel", "7", "--network", "mainnet", ...base], server, dir);
+    expect(result.exitCode).toBe(EXIT.usage);
+    expect(result.stderr).toContain("--confirm-mainnet");
+    expect(server.submitted).toHaveLength(0);
   });
 
-  it("rejects an unknown network", async () => {
-    const run = await skn(["task", "expire", "3", "--network", "moon"], fakeRegistry());
-    expect(run.code).toBe(2);
+  it("never prints the signing key, even for a malformed one", async () => {
+    const bad = `${TEST_SECRET.slice(0, 40)}XXXX`;
+    const result = await skn(["task", "cancel", "7", ...base], new FakeRpc(), dir, { SKN_SECRET_KEY: bad });
+    expect(result.exitCode).toBe(EXIT.usage);
+    expect(result.stdout + result.stderr).not.toContain(bad);
+    expect(result.stdout + result.stderr).not.toContain(TEST_SECRET.slice(0, 20));
+  });
+
+  it("names the available commands for an unknown one", async () => {
+    const result = await skn(["task", "frobnicate"], new FakeRpc(), dir);
+    expect(result.exitCode).toBe(EXIT.usage);
+    expect(result.stderr).toContain("cancel");
   });
 });

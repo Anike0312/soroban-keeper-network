@@ -1,34 +1,101 @@
-import type { Command } from "commander";
+import { Address } from "@stellar/stellar-sdk";
+import { parseCommandArgs, UsageError, type CommandContext } from "../../args.js";
+import { type RunResult } from "../../output.js";
+import { describeWait } from "../parse.js";
+import { finish, openReadOnly, type Session } from "../session.js";
+import { keeperToLookUp } from "./target.js";
 
-import { CliError, EXIT_USAGE } from "../../errors.js";
-import type { Handler, Runner } from "../types.js";
-
-/** The keeper to look at: `--keeper`, else the address of the configured signing key. */
-async function keeperAddress(ctx: Parameters<Handler>[0], opts: Parameters<Handler>[1]["opts"]): Promise<string> {
-  if (typeof opts.keeper === "string") return opts.keeper;
-  try {
-    return (await ctx.signer()).publicKey;
-  } catch (error) {
-    if (error instanceof CliError) {
-      throw new CliError(`Say which keeper to look at with --keeper <G...>, or provide a signing key. (${error.message})`, EXIT_USAGE);
-    }
-    throw error;
-  }
+/** What `scValToNative` makes of the contract's `ReputationRecord`. */
+interface RawReputation {
+  successes: bigint | number;
+  missed_claims: bigint | number;
+  score_bps: number | bigint;
+  last_updated_ledger: number | bigint;
 }
 
-export const balanceHandler: Handler = async (ctx, { opts }) => {
-  const keeper = await keeperAddress(ctx, opts);
-  const balance = await ctx.chain.registry.keeperBalance(keeper);
+export interface Reputation {
+  /** Score in basis points, decayed to the current ledger. */
+  scoreBps: number;
+  successes: number;
+  missedClaims: number;
+}
 
-  ctx.out.line(`Keeper ${keeper}`);
-  ctx.out.line(`  balance: ${balance}`);
-  ctx.out.result({ keeper, balance });
-};
+/**
+ * The keeper's reputation as of now. This reads the contract's
+ * `effective_reputation` view, which applies the time decay, rather than
+ * `keeper_reputation`, which returns the stored score as it was at the
+ * keeper's last action.
+ */
+async function readEffectiveReputation(
+  session: Session,
+  keeper: string,
+): Promise<Reputation> {
+  const raw = await session.client.read<RawReputation>("effective_reputation", [
+    new Address(keeper).toScVal(),
+  ]);
+  return {
+    scoreBps: Number(raw.score_bps),
+    successes: Number(raw.successes),
+    missedClaims: Number(raw.missed_claims),
+  };
+}
 
-export function balanceCommand(parent: Command, run: Runner): void {
-  parent
-    .command("balance")
-    .description("Show a keeper's accrued reward balance")
-    .option("--keeper <address>", "keeper to look up (defaults to the signing key's address)")
-    .action(run(balanceHandler));
+/** `skn keeper balance [--keeper <address>]`: reward balance, stake and effective reputation. */
+export async function runKeeperBalance(
+  args: readonly string[],
+  context: CommandContext,
+): Promise<RunResult> {
+  const { values, positionals } = parseCommandArgs(args, { keeper: { type: "string" } });
+  if (positionals.length > 0) {
+    throw new UsageError(`unexpected argument '${positionals[0]}'; usage: skn keeper balance [--keeper <address>]`);
+  }
+  const keeper = await keeperToLookUp(values, context);
+  const session = await openReadOnly(values, context);
+
+  const balance = await session.client.keeperBalance(keeper);
+  const stake = await session.client.keeperStake(keeper);
+  const unbonding = await session.client.pendingUnbond(keeper);
+
+  // An older registry may not have the reputation view. That should not hide
+  // the balance and stake, so it is reported as a warning instead.
+  let reputation: Reputation | null = null;
+  try {
+    reputation = await readEffectiveReputation(session, keeper);
+  } catch (err) {
+    session.warnings.push(
+      `could not read reputation: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const lines = [`Keeper ${keeper}`, `  balance:    ${balance}`, `  stake:      ${stake}`];
+  let unbondingView: { amount: bigint; unlockLedger: number; ledgersRemaining: number } | null = null;
+  if (unbonding !== undefined) {
+    const now = (await session.server.getLatestLedger()).sequence;
+    const remaining = Math.max(0, unbonding.unlockLedger - now);
+    unbondingView = {
+      amount: unbonding.amount,
+      unlockLedger: unbonding.unlockLedger,
+      ledgersRemaining: remaining,
+    };
+    lines.push(
+      `  unbonding:  ${unbonding.amount}, ` +
+        (remaining === 0
+          ? `withdrawable now (unlocked at ledger ${unbonding.unlockLedger})`
+          : `withdrawable at ledger ${unbonding.unlockLedger}, in ${describeWait(remaining)}`),
+    );
+  }
+  lines.push(
+    reputation === null
+      ? "  reputation: unavailable"
+      : `  reputation: ${(reputation.scoreBps / 100).toFixed(2)}% ` +
+          `(${reputation.successes} executed, ${reputation.missedClaims} missed)`,
+  );
+
+  return finish(session, lines.join("\n"), {
+    keeper,
+    balance,
+    stake,
+    unbonding: unbondingView,
+    reputation,
+  });
 }

@@ -1,35 +1,45 @@
-import type { Command } from "commander";
+import { KeeperErrorCode, isKeeperError } from "@soroban-keeper-network/sdk";
+import { parseCommandArgs, UsageError, type CommandContext } from "../../args.js";
+import { type RunResult } from "../../output.js";
+import { finish, isRunResult, openSigned, requireMainnetConfirmation } from "../session.js";
 
-import type { Handler, Runner } from "../types.js";
+/**
+ * `skn keeper withdraw`: pays the signing keeper's accrued rewards out to it.
+ * An empty balance reports "nothing to withdraw" and sends no transaction.
+ */
+export async function runKeeperWithdraw(
+  args: readonly string[],
+  context: CommandContext,
+): Promise<RunResult> {
+  const { values, positionals } = parseCommandArgs(args, {});
+  if (positionals.length > 0) {
+    throw new UsageError(`unexpected argument '${positionals[0]}'; usage: skn keeper withdraw`);
+  }
+  const session = await openSigned(values, context);
+  if (isRunResult(session)) return session;
+  const keeper = session.address;
 
-export const withdrawHandler: Handler = async (ctx) => {
-  const signer = await ctx.signer();
-  const keeper = signer.publicKey;
-  const { registry } = ctx.chain;
-
-  // Checked first so an empty balance never costs a simulated, let alone a
-  // submitted, transaction.
-  const available = await registry.keeperBalance(keeper);
+  // Checked here, before the mainnet guard, so that an empty balance does not
+  // demand --confirm-mainnet for a transaction that will never be sent.
+  const available = await session.client.keeperBalance(keeper);
   if (available === 0n) {
-    ctx.out.line("Nothing to withdraw: the balance is zero.");
-    ctx.out.result({ keeper, withdrawn: 0n });
-    return;
+    return finish(session, "Nothing to withdraw: the balance is zero.", { keeper, withdrawn: 0n });
   }
 
-  // `tryWithdrawRewards` covers the balance having been drained between the
-  // check above and the call.
-  const withdrawn = await registry.tryWithdrawRewards({ keeper, signer });
-  if (withdrawn === 0n) {
-    ctx.out.line("Nothing to withdraw: the balance was emptied before the withdrawal ran.");
-  } else {
-    ctx.out.line(`Withdrew ${withdrawn} to ${keeper}.`);
+  requireMainnetConfirmation(session.settings);
+  let withdrawn: bigint;
+  try {
+    // The SDK repeats the balance check and skips the transaction when it is
+    // zero, so a balance emptied since the read above costs no fee either.
+    withdrawn = (await session.client.withdrawRewards({ keeper, signer: session.signer })).amount;
+  } catch (err) {
+    // Emptied between the SDK's check and the transaction: same outcome.
+    if (!isKeeperError(err, KeeperErrorCode.NoRewardsAvailable)) throw err;
+    withdrawn = 0n;
   }
-  ctx.out.result({ keeper, withdrawn });
-};
-
-export function withdrawCommand(parent: Command, run: Runner): void {
-  parent
-    .command("withdraw")
-    .description("Withdraw the signing keeper's accrued rewards")
-    .action(run(withdrawHandler));
+  const text =
+    withdrawn === 0n
+      ? "Nothing to withdraw: the balance was emptied before the withdrawal ran."
+      : `Withdrew ${withdrawn} to ${keeper}.`;
+  return finish(session, text, { keeper, withdrawn });
 }

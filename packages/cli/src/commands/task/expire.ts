@@ -1,24 +1,32 @@
-import type { Command } from "commander";
+import { parseCommandArgs, type CommandContext } from "../../args.js";
+import { type RunResult } from "../../output.js";
+import { expectPositionals, parseTaskId } from "../parse.js";
+import { finish, isRunResult, openSigned, requireMainnetConfirmation } from "../session.js";
+import { taskLines, taskView } from "./view.js";
 
-import { parseTaskId, printTask } from "../../format.js";
-import type { Handler, Runner } from "../types.js";
+/**
+ * `skn task expire <id>`: expires a task whose deadline has passed and returns
+ * the escrow to its owner. Any account may do this; the signing key only pays
+ * the fee.
+ */
+export async function runTaskExpire(
+  args: readonly string[],
+  context: CommandContext,
+): Promise<RunResult> {
+  const { values, positionals } = parseCommandArgs(args, {});
+  expectPositionals(positionals, 1, "skn task expire <task-id>");
+  const taskId = parseTaskId(positionals[0]);
 
-export const expireHandler: Handler = async (ctx, { args }) => {
-  const taskId = parseTaskId(args[0] ?? "");
-  const signer = await ctx.signer();
+  const session = await openSigned(values, context);
+  if (isRunResult(session)) return session;
+  requireMainnetConfirmation(session.settings);
 
-  // Anyone may expire a task past its deadline; the signer only pays the fee.
-  await ctx.chain.registry.expireTask({ taskId, caller: signer.publicKey, signer });
+  await session.client.expireTask({ taskId, caller: session.address, signer: session.signer });
 
-  ctx.out.line(`Expired task ${taskId}; the escrowed reward went back to its owner.`);
-  const task = printTask(ctx.out, taskId, await ctx.chain.registry.getTask(taskId));
-  ctx.out.result({ action: "expire", task });
-};
-
-export function expireCommand(parent: Command, run: Runner): void {
-  parent
-    .command("expire")
-    .description("Expire a task whose deadline has passed (any account may do this)")
-    .argument("<task-id>", "id of the task")
-    .action(run(expireHandler));
+  const view = taskView(taskId, await session.client.getTask(taskId));
+  return finish(
+    session,
+    [`Expired task ${taskId}; the escrowed reward went back to its owner.`, ...taskLines(view)].join("\n"),
+    { action: "expire", task: view },
+  );
 }

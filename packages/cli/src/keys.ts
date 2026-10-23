@@ -1,111 +1,107 @@
+import { readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
+
 /**
- * Where a signing key can come from, and the rules that keep it from leaking.
- *
- * There is deliberately no `--secret-key <value>` flag: an argument lands in
- * shell history and in the process table (`ps`) for anyone on the machine.
- * The accepted sources are an environment variable, a file, or stdin.
- *
- * Nothing here ever includes the key, or any part of it, in an error message.
+ * Where a signing key came from, in precedence order: `--key-file`, then
+ * `--identity`, then `SKN_SECRET_KEY`.
  */
+export type KeySource = "key-file" | "identity" | "env";
 
-import { readFileSync, statSync } from "node:fs";
-
-import { Keypair, StrKey } from "@stellar/stellar-sdk";
-import { keypairSigner, type TransactionSigner } from "@soroban-keeper-network/sdk";
-
-import { CliError, EXIT_USAGE } from "./errors.js";
-
-export const DEFAULT_SECRET_ENV = "SKN_SECRET_KEY";
-
-export interface KeyOptions {
-  /** Name of the environment variable holding the key. */
-  secretKeyEnv?: string | undefined;
-  /** Path of a file holding the key. Must not be readable by group or others. */
-  secretKeyFile?: string | undefined;
-  /** Read the key from standard input. */
-  secretKeyStdin?: boolean | undefined;
+export interface KeyFlags {
+  keyFile?: string | undefined;
+  identity?: string | undefined;
 }
 
-export interface KeyIo {
-  env: Record<string, string | undefined>;
-  readStdin(): Promise<string>;
-  stdinIsTty: boolean;
+export interface KeyContext {
+  env: NodeJS.ProcessEnv;
+  homeDir: string;
+  platform: NodeJS.Platform;
 }
 
-export async function loadSigner(options: KeyOptions, io: KeyIo): Promise<TransactionSigner> {
-  const secret = await readSecret(options, io);
-  if (!StrKey.isValidEd25519SecretSeed(secret)) {
-    throw new CliError(
-      "The signing key is not a valid Stellar secret seed (it should start with S and be 56 characters). " +
-        "The key itself is not shown.",
-      EXIT_USAGE,
-    );
+/**
+ * A resolved key. `secret` is the only field that holds key material. Every
+ * other field is safe to print, and callers must print only those.
+ */
+export interface ResolvedKey {
+  source: KeySource;
+  /** Where the key was read from: a path, an identity name, or an env var name. */
+  origin: string;
+  secret: string;
+}
+
+export class KeyError extends Error {}
+
+/** A Stellar ed25519 secret seed: `S` followed by 55 base32 characters. */
+const SECRET_PATTERN = /^S[A-Z2-7]{55}$/;
+const IDENTITY_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+const IDENTITY_SECRET_PATTERN = /^\s*secret_key\s*=\s*"(S[A-Z2-7]{55})"/m;
+
+export const ENV_SECRET_KEY = "SKN_SECRET_KEY";
+
+/**
+ * Returns the signing key for this invocation, or `undefined` when no source is
+ * set. Errors never include the key or any part of it.
+ */
+export async function resolveKey(
+  flags: KeyFlags,
+  context: KeyContext,
+): Promise<ResolvedKey | undefined> {
+  if (flags.keyFile !== undefined) {
+    return readKeyFile(flags.keyFile, context.platform);
   }
-  return keypairSigner(Keypair.fromSecret(secret));
-}
-
-async function readSecret(options: KeyOptions, io: KeyIo): Promise<string> {
-  const chosen = [
-    options.secretKeyEnv !== undefined,
-    options.secretKeyFile !== undefined,
-    options.secretKeyStdin === true,
-  ].filter(Boolean).length;
-  if (chosen > 1) {
-    throw new CliError(
-      "Choose one signing-key source: --secret-key-env, --secret-key-file or --secret-key-stdin.",
-      EXIT_USAGE,
-    );
+  if (flags.identity !== undefined) {
+    return readIdentity(flags.identity, context.homeDir);
   }
-
-  if (options.secretKeyStdin) {
-    if (io.stdinIsTty) {
-      throw new CliError(
-        "--secret-key-stdin expects the key to be piped in, for example: skn ... --secret-key-stdin < keyfile",
-        EXIT_USAGE,
-      );
+  const fromEnv = context.env[ENV_SECRET_KEY];
+  if (fromEnv !== undefined && fromEnv.trim() !== "") {
+    const secret = fromEnv.trim();
+    if (!SECRET_PATTERN.test(secret)) {
+      throw new KeyError(`${ENV_SECRET_KEY} is not a valid secret key`);
     }
-    return nonEmpty((await io.readStdin()).trim(), "standard input");
+    return { source: "env", origin: ENV_SECRET_KEY, secret };
   }
-
-  if (options.secretKeyFile !== undefined) {
-    return nonEmpty(readKeyFile(options.secretKeyFile), `file ${options.secretKeyFile}`);
-  }
-
-  const name = options.secretKeyEnv ?? DEFAULT_SECRET_ENV;
-  const value = io.env[name]?.trim();
-  if (!value) {
-    throw new CliError(
-      `No signing key found. Set ${name}, or use --secret-key-file <path> or --secret-key-stdin. ` +
-        "Keys are never accepted as a command-line argument.",
-      EXIT_USAGE,
-    );
-  }
-  return value;
+  return undefined;
 }
 
-function readKeyFile(path: string): string {
-  let mode: number;
+async function readKeyFile(path: string, platform: NodeJS.Platform): Promise<ResolvedKey> {
+  let info;
   try {
-    mode = statSync(path).mode;
+    info = await stat(path);
   } catch {
-    throw new CliError(`Cannot read the key file ${path}.`, EXIT_USAGE);
+    throw new KeyError(`key file ${path} does not exist or cannot be read`);
   }
-  // Group/other bits on a secret are a mistake worth stopping for, like ssh
-  // does with private keys. Not checked on Windows, which has no such bits.
-  if (process.platform !== "win32" && (mode & 0o077) !== 0) {
-    throw new CliError(
-      `The key file ${path} is readable by other users. Run: chmod 600 ${path}`,
-      EXIT_USAGE,
+  // Windows does not carry POSIX permission bits, so the check applies only
+  // on platforms where `mode` means something.
+  if (platform !== "win32" && (info.mode & 0o077) !== 0) {
+    throw new KeyError(
+      `key file ${path} is readable by other users; restrict it with chmod 600`,
     );
   }
-  try {
-    return readFileSync(path, "utf8").trim();
-  } catch {
-    throw new CliError(`Cannot read the key file ${path}.`, EXIT_USAGE);
+
+  const secret = (await readFile(path, "utf8")).trim();
+  if (!SECRET_PATTERN.test(secret)) {
+    throw new KeyError(`key file ${path} does not contain a valid secret key`);
   }
+  return { source: "key-file", origin: path, secret };
 }
 
-function nonEmpty(value: string, where: string): string {
-  if (!value) throw new CliError(`The signing key from ${where} is empty.`, EXIT_USAGE);
-  return value;
+async function readIdentity(name: string, homeDir: string): Promise<ResolvedKey> {
+  if (!IDENTITY_NAME_PATTERN.test(name)) {
+    throw new KeyError(`identity name '${name}' may only contain letters, digits, '-' and '_'`);
+  }
+  const path = join(homeDir, ".config", "stellar", "identity", `${name}.toml`);
+
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    throw new KeyError(`no Stellar CLI identity named '${name}' at ${path}`);
+  }
+  const match = IDENTITY_SECRET_PATTERN.exec(text);
+  if (!match || match[1] === undefined) {
+    throw new KeyError(
+      `identity '${name}' has no secret_key; seed-phrase identities are not supported yet`,
+    );
+  }
+  return { source: "identity", origin: name, secret: match[1] };
 }
