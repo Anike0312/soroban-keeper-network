@@ -7,6 +7,8 @@ import { runBatchRegister } from "./commands/batch/register.js";
 import { runConfigInit, runConfigShow } from "./commands/config.js";
 import { runDeploy } from "./commands/deploy.js";
 import { runInspect, runInspectVersion } from "./commands/inspect.js";
+import { runKeeperCommand } from "./commands/keeper/index.js";
+import { runTaskCommand } from "./commands/task/index.js";
 import type { ConfirmFn } from "./confirm.js";
 import { commandError } from "./failures.js";
 import { ok, usage, type RunResult } from "./output.js";
@@ -52,8 +54,8 @@ Usage:
 
 Command groups:
   config    init | show: manage the config file and named profiles
-  task      register, show, list, claim and execute tasks
-  keeper    keeper balance and withdrawal
+  task      register | cancel | expire | increase-reward | extend-deadline (show, list, claim, execute: not yet)
+  keeper    balance | withdraw | stake | unbond | withdraw-stake | unbonding
   admin     pause | unpause | set-fee-bps | set-min-reward | set-min-stake | set-dispute-window | sweep-fees
   batch     register: batch task registration from JSON or CSV
   deploy    registry | treasury | all: upload WASM, deploy and initialize contracts
@@ -139,6 +141,14 @@ export async function run(argv: readonly string[], options: RunOptions = {}): Pr
         return usage("'skn batch' needs a command (for example 'skn batch register <file>')", json);
       }
       return usage(`'skn batch ${second}' is not implemented yet`, json);
+    }
+
+    if (first === "task") {
+      return await runTaskCommand(second, rest, context);
+    }
+
+    if (first === "keeper") {
+      return await runKeeperCommand(second, rest, context);
     }
 
     if (first === "deploy") {
