@@ -18,6 +18,7 @@ without blocking your PR.
 | `indexer-client` | Required | The indexer's TypeScript client (`packages/indexer-client`) must typecheck, build, test and lint, and its generated types must match `indexer/openapi.yaml`. |
 | `clippy` | Advisory (`continue-on-error: true`) | Lints are useful but subjective enough that a maintainer should decide case-by-case, not have every PR blocked by a new upstream lint. |
 | `audit` | Advisory (`continue-on-error: true`) | A new upstream dependency CVE should notify maintainers, not fail every open PR the moment it's published. |
+| `deny` | Advisory (`continue-on-error: true`) | License allow-list enforcement, duplicate crate version detection, yanked crate warnings, and source validation via `cargo-deny`. See [Cargo-deny](#cargo-deny) below. |
 | `wasm-size` | Advisory (`continue-on-error: true`) | Reports binary size for visibility; see below. |
 | `sdk-ts-lint` | Advisory (`continue-on-error: true`) | `npm run lint` (ESLint) on `packages/sdk-ts`. Lint findings are subjective enough that a maintainer should decide case-by-case, the same reasoning as `clippy`. See [SDK typecheck and lint](#sdk-typecheck-and-lint). |
 | `sdk-bundle-size` | Advisory (`continue-on-error: true`) | Reports the SDK's minified+gzipped bundle size for visibility — the frontend analogue of `wasm-size`; see below. |
@@ -65,7 +66,54 @@ make sdk-ts        # typecheck + build + test (required)
 make sdk-ts-lint   # ESLint (advisory)
 ```
 
-## The keeper-bot-v2 job
+## Cargo-deny
+
+The `deny` job runs `cargo deny check` to enforce:
+
+- **Licenses**: Every crate in the dependency graph must have a license in the allow-list (`deny.toml`). New dependencies must declare an OSI-approved license (MIT, Apache-2.0, BSD, etc.). Copyleft licenses (GPL, AGPL) are denied by policy.
+- **Bans**: Duplicate major versions of the same crate are reported as warnings, so the dependency tree remains minimal. A crate is rejected only if it is explicitly denied in `deny.toml`.
+- **Advisories**: Security advisories and yanked (unpublished) crates are reported as warnings, matching the advisory-first posture of the `audit` job.
+- **Sources**: Crates must come from `crates.io` or explicitly approved git repositories. Unusual sources (private registries, mirrors) are flagged.
+
+This is an **advisory-first rollout**: findings appear in the job summary but do not block the PR. Over time, as findings are reviewed and triaged, the job can be changed to `deny` (blocking) via `.github/workflows/ci.yml`.
+
+### License allow-list
+
+The allow-list in `deny.toml` is constructed from **actual project usage**: every license that appears in the workspace's dependency graph today. To add a new dependency with a previously-unseen license:
+
+1. Run `cargo add <crate>` in the workspace.
+2. Run `cargo deny check licenses` locally.
+3. If the license is new:
+   - Check if it is a common permissive license (MIT, Apache-2.0, BSD, MPL-2.0).
+   - If it is restrictive (GPL, AGPL) or non-standard, open an issue or discussion for maintainer approval first.
+   - Once approved, add the SPDX identifier to the `allow` list in `deny.toml` with a comment explaining why (e.g., "required by the indexer's database bindings").
+
+### Updating the policy
+
+To make the `deny` job blocking (required):
+
+1. Update `.github/workflows/ci.yml` to remove `continue-on-error: true` from the `deny` job.
+2. Update the table in this doc to change `deny` from "Advisory" to "Required".
+3. Open a PR and confirm all advisories and license mismatches have been reviewed.
+
+### Running locally
+
+```bash
+# Check licenses only
+cargo deny check licenses
+
+# Check for duplicate versions, yanked crates, and advisories
+cargo deny check
+
+# Detailed output with statistics
+cargo deny check --show-stats
+```
+
+See [`https://embarkstudios.github.io/cargo-deny/`](https://embarkstudios.github.io/cargo-deny/) for full `cargo-deny` documentation.
+
+## WASM size tracking
+
+The `wasm-size` job builds the release WASM, runs it through `wasm-opt -Oz`
 
 The `bot-v2` job covers `examples/keeper-bot-v2`: TypeScript compilation (`npm run build`), linting (`npm run lint`), and its test suites (`npm test`: vitest for the TypeScript service in `src/`, then `node --test` for the CommonJS components in `bot/`).
 

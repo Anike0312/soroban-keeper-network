@@ -218,6 +218,48 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────────────────────────
+  # ADVISORY — license, dependency ban, and security advisory checks via
+  # cargo-deny. Licenses must match the allow-list in deny.toml; duplicate
+  # crate versions and known yanked crates are reported. Advisory-first rollout
+  # matching the `audit` job, so findings surface without blocking the PR.
+  # ───────────────────────────────────────────────────────────────────────────
+  deny:
+    name: Dependency check (licenses, bans, advisories, sources) (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.17.1
+
+      - name: cargo deny check
+        run: |
+          cargo deny check --all-features 2>&1 | tee deny-output.txt || true
+          {
+            echo "### Dependency check (licenses, bans, advisories, sources)"
+            echo
+            if grep -q "error:" deny-output.txt; then
+              echo "Cargo-deny reported errors (advisory only — this does not block the PR):"
+              echo
+              echo '```'
+              grep -A 2 "^error:" deny-output.txt || cat deny-output.txt
+              echo '```'
+            elif grep -q "warning:" deny-output.txt; then
+              echo "Cargo-deny reported warnings (advisory only — this does not block the PR):"
+              echo
+              echo '```'
+              grep -A 2 "^warning:" deny-output.txt || cat deny-output.txt
+              echo '```'
+            else
+              echo "All license, ban, advisory, and source checks passed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
   # ADVISORY — report the optimized WASM size so reviewers can spot a
   # regression without having to build locally.
   # ───────────────────────────────────────────────────────────────────────────
