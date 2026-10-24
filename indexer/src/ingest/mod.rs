@@ -121,6 +121,7 @@ mod tests {
                 RawValue::Address("GOWNER".into()),
                 RawValue::I128(500),
                 RawValue::U64(9_000),
+                RawValue::Void,
             ],
         }
     }
